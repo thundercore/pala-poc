@@ -1,0 +1,21 @@
+{
+    "cSpell.words": [
+        "Chans",
+        "Ethereum's",
+        "LLRB",
+        "Reconf",
+        "Thunderella",
+        "Unmarshaller",
+        "i'th",
+        "notas",
+        "pala",
+        "petar",
+        "s'th",
+        "stretchr",
+        "uninserted",
+        "unnotarized",
+        "unvoted"
+    ],
+    "go.vetOnSave": "off",
+    "go.lintTool": "golangci-lint"
+}

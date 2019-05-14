@@ -1,0 +1,13 @@
+run:
+  skip-dirs:
+    - pkg
+    - src/thunder2/vendor
+linters:
+  enable:
+    - golint
+  fast: false
+issues:
+  exclude-rules:
+    - linters:
+      - golint
+      text: "Id"

@@ -1,9 +1,24 @@
 package utils
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
+
+	"github.com/pkg/errors"
 )
+
+// Used by errors.
+type TemporaryError interface {
+	Error() string
+	IsTemporary() bool
+}
+
+type TemporaryErrorImpl struct {
+	// Use error instead of string to hold the flexibility to do more things when needed.
+	err       error
+	temporary bool
+}
 
 // Copied from src/thunder/utils/mutex.go and src/thunder/libs/debug/debug.go
 type CheckedLock struct {
@@ -83,4 +98,74 @@ func Fatal(s string, args ...interface{}) {
 //           Possible state transition not yet implemented
 func NotImplemented(s string, args ...interface{}) {
 	panic(fmt.Sprintf("NOT IMPLEMENTED: "+s, args...))
+}
+
+// This is more efficient than append().
+// See https://stackoverflow.com/a/40678026/278456
+func ConcatCopyPreAllocate(slices [][]byte) []byte {
+	var totalLen int
+	for _, s := range slices {
+		totalLen += len(s)
+	}
+	tmp := make([]byte, totalLen)
+	var i int
+	for _, s := range slices {
+		i += copy(tmp[i:], s)
+	}
+	return tmp
+}
+
+func Uint32ToBytes(n uint32) []byte {
+	var result [4]byte
+	binary.LittleEndian.PutUint32(result[:], n)
+	return result[:]
+}
+
+func BytesToUint32(bytes []byte) (uint32, []byte, error) {
+	if len(bytes) < 4 {
+		return 0, nil, errors.Errorf("len(bytes) = %d < 4", len(bytes))
+	}
+	v := binary.LittleEndian.Uint32(bytes)
+	return v, bytes[4:], nil
+}
+
+func Uint16ToBytes(n uint16) []byte {
+	var result [2]byte
+	binary.LittleEndian.PutUint16(result[:], n)
+	return result[:]
+}
+
+func BytesToUint16(bytes []byte) (uint16, []byte, error) {
+	if len(bytes) < 2 {
+		return 0, nil, errors.Errorf("len(bytes) = %d < 2", len(bytes))
+	}
+	return binary.LittleEndian.Uint16(bytes), bytes[2:], nil
+}
+
+func StringToBytes(s string) []byte {
+	bytes := []byte(s)
+	return append(Uint16ToBytes(uint16(len(bytes))), bytes...)
+}
+
+func BytesToString(bytes []byte) (string, []byte, error) {
+	n, bytes, err := BytesToUint16(bytes)
+	if err != nil {
+		return "", nil, err
+	}
+	s := string(bytes[:n])
+	return s, bytes[n:], nil
+}
+
+//--------------------------------------------------------------------
+
+func NewTemporaryError(err error, temporary bool) error {
+	return TemporaryErrorImpl{err, temporary}
+}
+
+func (e TemporaryErrorImpl) Error() string {
+	return e.err.Error()
+}
+
+func (e TemporaryErrorImpl) IsTemporary() bool {
+	return e.temporary
 }

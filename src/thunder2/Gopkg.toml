@@ -1,0 +1,11 @@
+[[constraint]]
+  name = "github.com/stretchr/testify"
+  version = "v1.2.2"
+
+[[constraint]]
+  name = "github.com/pkg/errors"
+  version = "v0.8.1"
+
+[[constraint]]
+  name = "github.com/petar/GoLLRB"
+  revision = "53be0d36a84c2a886ca057d34b6aa4468df9ccb4"

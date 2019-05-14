@@ -1,0 +1,17 @@
+# go dep
+/pkg/
+/src/thunder2/vendor/
+/src/thunder2/Gopkg.dep
+/src/thunder2/Gopkg.lock
+
+# GNUmakefile customization
+/Local.mk
+
+# binary
+/bin
+
+# temp file
+golangci-lint.log
+*.swp
+*.swo
+*.idea
