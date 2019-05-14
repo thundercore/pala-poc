@@ -1,0 +1,557 @@
+PaLa - doubly pipelined scheme
+==============================
+
+We can separate the consensus protocol into two layers:
+1. The consensus layer: PaLa, PiLi, Thunderella, etc.
+2. The network layer: where the connection topology can be a complete graph, hub-and-spoke etc.
+
+The consensus layer is basically a state machine which reacts to events, thus
+we model it in the pseudo code as objects whose methods would fire
+when relevant events occur.
+
+We don't explicitly assign a role to the consensus nodes because a node can act
+as a proposer, voter, and data archival full node simultaneously.
+The right behavior to take should be determined by checking whether a node is acting as
+the corresponding role when a particular event occurs.
+
+This pseudo code also covers committee switches, even though it's not
+mentioned explicitly. A committee switch event occurs whenever a block
+storing a new election result is finalized.
+We notify the network layer to make the required connection changes when this happens.
+
+The consensus layer requires its different data types to be sent and received based on
+the following rules:
+* The primary proposer sends proposals to all voters and standby proposers.
+* The voters send their votes to the primary proposer.
+* The primary proposer sends notarizations to all voters and standby proposers.
+* The voters send clock messages to *all* proposers.
+* All proposers send clock message notarizations to all proposers and voters
+  when they receive clock messages from at least 2/3 of voters.
+
+There are also heartbeat messages, which contain the status of its originating node and include:
+* the local epoch.
+* the sequence number of the last block of the freshest notarized chain.
+Heartbeat messages are sent to all connected nodes.
+
+network layer
+-------------
+
+A hub-and-spoke network connection topology could satisfy the data transport requirements
+of the consensus layer where proposers/voters would map to hubs/spokes.
+
+An implementation could use TCP connections for all connections between nodes.
+
+See the software architecture proposal for details
+https://docs.google.com/presentation/d/1WlGYLMuQ5SQHCf1KOvaZOY2EKwOFfACG0dTcSjMKjQs/edi
+
+Notations
+--------------
+
+* Functions use CamelCase.
+* Variables use snake_case.
+* Enumerations/Constants use ALL_CAPS
+* When there are many different variables of one type of data,
+  use {...} to indicate which one is referenced. For example, voter{5} is the 5th voter.
+* "x := Foo(...)" means "assign the returned value of Foo(...) to the variable x".
+* self.x means that x is a member field.
+
+
+Identifiers
+---------
+
+* K                       : the number of outstanding unnotarized proposals.
+* Np                      : the number of proposers.
+* Nv                      : the number of voters.
+* proposer{i}             : the i'th proposer.
+* voter{i}                : the i'th voter.
+* local_epoch             : the local epoch as defined in the paper.
+* seq                     : (epoch, s) also written as (e, s) where s is a serial number
+* block{seq}              : the block created at seq = (e, s), i.e. the s'th block
+                            created at local_epoch = e;
+* proposal{seq}           : a proposal that contains block{seq} and the proposer's signature.
+* vote{voter{i}, seq}     : a vote for block{seq} from voter{i} at local_epoch = seq.e.
+* nota{seq}               : a notarization of block{seq}. Note that there may be
+                            multiple different and valid nota{seq}'s.
+* clock{voter{i}, e}      : the timeout message sent by voter{i} at local_epoch = e-1
+* clock_nota{e}           : the notarization of clock{voter{i}, e}.
+
+* chain                   : represents block{(0, 1)}->...->block{seq} where block{seq} is the last block.
+* chain[i]                : the i'th block; chain[-1] is the last block.
+* chain[i].seq            : the i'th block's sequence;
+                            the sequence is in the form of seq, i.e. (epoch, s).
+* notarized_chain         : a chain whose blocks are all notarized.
+                            E.g., block{(0, 1)}->block{(1, 1)}->...->block{seq}
+                            with {nota{(1, 1)}..., nota{seq}}, where block{(0, 1)} is the genesis
+                            block and is treated as notarized even though it has no notarization.
+* blockchain              : represents the database which stores the data of the chain.
+* freshest_notarized_chain: defined as:
+                            freshest_notarized_chain[-1].seq >= notarized_chain[-1].seq
+                            for each notarized_chain.
+* self                    : the consensus node itself.
+* IsPrimaryProposer(self, e) : whether self is the primary proposer at local_epoch = e.
+* IsVoter(self, e)        : whether self is a voter at local_epoch = e.
+* Finalized(freshest_notarized_chain): returns the finalized chain given the freshest notarized chain.
+
+* delta                   : a config variable used to estimate the time of delivering a message.
+* 1sec                    : 6*delta
+* 1min                    : 6*1sec
+
+
+The common code of Proposer and Voter
+-------------------------------------
+
+    # Implementation notes: only blockchain stores permanent data.
+
+    func Main(self):
+      self.blockchain := LoadBlockChain()
+      self.freshest_notarized_chain := CreateFreshestNotarizedChain(self.blockchain, 0)
+      self.clocks := CreateClockMap() # key: epoch; value: a set of clock{voter{i}, e}}
+      self.votes := CreateVotesMap()  # key: seq; value: a set of vote{voter{i}, seq}}
+      self.has_voted := CreateSet()   # key: seq
+      self.unnotarized_proposals := CreateProposalMap()  # key: seq;
+                                                         # value: proposal{seq}
+      self.uninserted_proposals := CreateProposalMap()  # key: seq;
+                                                        # value: proposal{seq}
+      self.unvoted_proposals := CreateProposalMap()  # key: seq;
+                                                     # value: proposal{seq}
+      self.local_epoch := LoadEpochFromDisk()
+      OnEpochChanged(self.local_epoch)
+      StartNetwork()                # Start threads to process the network layer
+      StartEventLoop()              # Wait for callbacks OnXXX() to fire and advance the system state.
+
+
+    func LoadBlockChain():
+      # Load blockchain data from disk.
+      # If there is no data, create and insert the genesis block, block{(0, 1)}.
+      # NOTE: there is no nota{(0, 1)}. Just treat block{(0, 1)} as notarized.
+      ...
+
+
+    func LoadEpochFromDisk(): -> int
+      # Read clock notarization saved by SaveEpochToDisk()
+      # If there is anything wrong, use freshest_notarized_chain[-1].seq.e instead.
+      ...
+
+    # Implementation notes:
+    # 1. All callbacks/functions are called in the same thread (no lock by default).
+    # 2. Let nota{seq'} be the notarization of some ancestor block.
+    #    Store nota{seq'} in block{seq} where block{seq'} is the k'th ancestor of block{seq}
+    #    If seq is (e, 1), store in this block, the notarization of up to the last k blocks that belong
+    #    to the same epoch as the parent block of (e, 1).
+
+    func OnReceivedNotarizedBlock(self, nota{seq}, block{seq}): -> boolean
+      if Verify(nota{seq}, block{seq}) == false:
+        return false
+      OnReceivedBlock(block{seq})
+
+
+    # NOTE: To prevent potential attacks such as sending a lot of blocks to cause a denial of service,
+    # we never accept a block from outside without proof.
+    #
+    # Here are the scenarios of calling this function:
+    # 1. (self.blockchain -> OnReceivedBlock)
+    #    The primary/standby proposer receives a block created by self.
+    # 2. (the network layer receives a proposal -> OnReceivedProposal -> OnReceivedBlock)
+    #    The primary proposer sends a proposal to the node. Or the node is behind and
+    #    fetches the proposal from the primary proposer.
+    # 3. (the network layer receives a notarized block -> OnReceivedNotarizedBlock -> OnReceivedBlock)
+    #    The node is behind and fetches the notarized block from the primary proposer.
+    # The argument source (BY_SELF or BY_OTHER) is used to distinguish case 1 and {2,3}.
+    func OnReceivedBlock(self, block{seq}, source): -> boolean
+      if BlockChainVerify(self.blockchain, block{seq}) == false:
+        return false
+      if seq.e > self.local_epoch:
+        # We can pull this block after our local epoch have caught up.
+        # Otherwise, an attacker can keep sending blocks until the node runs out of space.
+        return false
+      if source == BY_OTHER:
+        # NOTE: Insert() follows these rules (among others):
+        # * Reject the block if the parent block does not exist.
+        # * Reject the block if block{seq} and nota{seq} already exist.
+        # * Reject the block if the block is not extended from the last block
+        #   of a finalized chain.
+        if Insert(self.blockchain, block{seq}) == false:
+          return false
+
+        # Now the block is in self.blockchain. However, the block is not permanent yet.
+        # We'll trim unnecessary blocks after the finalized chain extends.
+
+        # GetNotarizations() returns a list. The size may be in the range [0, K].
+        for nota{seq'} in GetNotarizations(block{seq}):
+          OnReceivedNotarization(self, nota{seq'})
+
+      if source == BY_SELF:
+        if IsPrimaryProposer(self, seq.e):
+          proposal{seq} := CreateProposal(block{seq})
+          # Keep recent unnotarized proposals, so newly connected voters
+          # can pull them from us.
+          Add(self.unnotarized_proposals, proposal{seq})
+          BroadcastEvent(proposal{seq})
+        else:
+          StopCreatingNewBlocks(self.blockchain)
+      return true
+
+
+    func OnNewNodeConnected(self, new_node):
+      PerformReconciliation(self, new_node)
+
+
+    # NOTE: proposers/voters use TCP connections, so the received proposals should be in order.
+    # Here are the scenarios of calling this function:
+    # 1. (the network layer receives a proposal -> OnReceivedProposal)
+    #    The primary proposer pushes the proposal to other nodes.
+    # 2. (OnCaughtUp -> OnReceivedProposal)
+    #    The voter keeps recent proposals that it failed to Insert() in
+    #    uninserted_proposals and tries to catch up.
+    #    When the voter has caught up, it will call OnReceivedProposal on those uninserted_proposals.
+    func OnReceivedProposal(self, proposal{seq}, source):
+      if Verify(proposal{seq}) == false:
+        return
+
+      block{seq} := GetBlock(proposal{seq})
+      # This also covers the case that the node is both the primary proposer and a voter.
+      if source == BY_OTHER:
+        if OnReceivedBlock(block{seq}, BY_OTHER) == false:
+          if IsVoter(self, seq.e):
+            # Maybe the node is behind.
+            if Length(self.uninserted_proposals) < MAX_UNINSERTED_PROPOSAL:
+              Add(self.uninserted_proposals, proposal{seq})
+            # See if the node needs to catch up.
+            block{seq} := GetBlock(proposal{seq})
+            seq' := GetParent(block{seq}).seq
+            if seq' > self.freshest_notarized_chain[-1].seq:
+              CatchUp(seq'.e, seq', -1)
+          return
+      else:
+        # self.blockchain created and stored the block. No need to call OnReceivedBlock().
+
+      # Now we've confirmed self has the chain that contains the parent of proposal{seq},
+      # See if we need to vote on the proposal.
+      if IsVoter(self, seq.e) == false:
+        return
+
+      if self.local_epoch != seq.e:
+        if self.local_epoch < seq.e:
+          # Retry fetching the proposal and voting after the node has caught up.
+          CatchUp(seq.e, seq, -1)
+        return
+
+      Add(self.unvoted_proposals, proposal{seq})
+      TryVoting(self)
+
+
+    # We only expect OnReceivedVote to be called when the node
+    # is acting as the primary proposer
+    func OnReceivedVote(self, vote{voter{i}, seq}):
+      if IsPrimaryProposer(self, seq.e) == false:
+        // Not responsible for handling votes.
+        return
+      if seq.e < self.local_epoch:
+        // Ignore out-of-date votes.
+        return
+      if Verify(vote{voter{i}, seq}) == false:
+        return
+
+      if NotExist(self.votes, seq):
+        self.votes[seq] := CreateVoteSet()
+      Add(self.votes[seq], vote{voter{i}, seq})
+      if Length(self.votes[seq]) >= Ceil(Nv*2/3):
+         nota{seq} := CreateNotarization(self.votes[seq])
+         # Note that if we never switch the primary proposer, we don't need to broadcast
+         # the notarization here.
+         # The notarization, with potential late votes, will always be included in
+         # proposal{seq'} which contains block{seq'} and block{seq'} contains nota{seq}
+         # where seq'.s == seq.s + K.
+         # We're broadcasting the notarization to minimize the chance of losing the last K blocks
+         # in the face of a proposer switch, as explained below in the comment above
+         # OnReceivedNotarization().
+         BroadcastEvent(nota{seq})
+         OnReceivedNotarization(nota{seq})
+
+
+    # NOTE: Here are the scenarios where this function is called:
+    # 1. (the network layer receives a vote -> OnReceivedVote -> this)
+    #    The primary proposer received enough votes and just created the notarization.
+    #    This may happen multiple times for the same seq. Keep the one with the most votes.
+    # 2. (the network layer receives a proposal/notarized block -> ... -> OnReceivedBlock -> this)
+    #    The voter/standby proposer is falling behind the other nodes and catching up.
+    #    Some notarization is stored in the received block.
+    # 3. (the network layer receives a notarization -> this)
+    #    The voter/standby proposer receives the latest notarization directly from the primary
+    #    proposer. If we don't send/receive such type of notarization, only the primary proposer
+    #    knows the notarizations of the last K blocks. Whenever we switch the primary proposer,
+    #    the new proposer wouldn't know the notarizations of the last K blocks, so we'll lose
+    #    those blocks after a proposer switch. Recall that a proposer switch may be
+    #    triggered by either a timeout or a proposers/voters reconfiguration. It's undesirable to
+    #    lose liveness temporarily (by losing the last K blocks) after a reconfiguration.
+    #    Thus, we need this in addition to case 2.
+    func OnReceivedNotarization(self, nota{seq}):
+      if Verify(nota{seq}) == false:
+        return
+
+      # This might trigger self.blockchain to create new blocks if block creation was paused
+      # previously because we've reached the limit on the number of unnotarized blocks
+      # If nota{seq} already exists in self.blockchain, keep the one with the most votes.
+      if ExistBlock(self.blockchain, seq):
+        if InsertNotarization(self.blockchain, nota{seq}):
+          UpdateFreshestNotarizedChain(self, seq)
+
+
+    func UpdateFreshestNotarizedChain(self, seq):
+      freshest_notarized_chain' := CreateFreshestNotarizedChain(self.blockchain, seq)
+      if freshest_notarized_chain'[-1].seq <= self.freshest_notarized_chain[-1].seq:
+        return
+
+      self.freshest_notarized_chain := freshest_notarized_chain'
+      seq := self.freshest_notarized_chain[-1].seq
+      OnFreshestNotarizedChainExtended(self, seq)
+      UpdateFinalizedChain()
+
+      if seq.e == self.local_epoch:
+        # This node might have been a voter in the previous epoch,
+        # thus CancelIfSet() is called outside "if IsVoter()".
+        CancelIfSet(self.timeout_event)
+        if IsVoter(self, self.local_epoch):
+          // Will trigger OnTimeout()
+          self.timeout_event := PostDelayedEvent(ON_TIMEOUT, [self, self.local_epoch], 1min)
+
+
+    # We only expect OnReceivedClock to be called when the node
+    # is acting as a proposer
+    func OnReceivedClock(self, clock{voter{i}, e}):
+      if e <= self.local_epoch:
+        return
+      if Verify(clock{voter{i}, e}) == false:
+        return
+
+      if NotExist(self.clocks, e):
+        self.clocks[e] := CreateClockSet()
+      Add(self.clocks[e], clock{voter{i}, e})
+      if Length(self.clocks[e]) >= Ceil(Nv*2/3):
+        clock_nota{e} := CreateClockNotarization(self.clocks[e])
+        BroadcastEvent(clock_nota{e})
+        OnEpochChanged(self, e)
+
+
+    func OnReceivedClockNotarization(self, clock_nota{e}):
+      if Verify(clock_nota{e}) == false:
+        return
+      OnEpochChanged(self, e)
+
+
+    func OnFreshestNotarizedChainExtended(self, seq):
+      if IsVoter(self, seq.e):
+        TryVoting(self)
+
+
+    func OnEpochChanged(self, e):
+      if self.local_epoch >= e:
+        return
+
+      self.local_epoch := e
+      SaveEpochToDisk(clock_nota{e})
+      # Reset out-of-date data used by proposers
+      self.unnotarized_proposals.Clear()
+      self.votes.Clear()
+      for e' in self.clocks:
+        if e' < self.local_epoch:
+          Remove(self.clocks, e')
+      # Reset out-of-date data used by voters
+      self.uninserted_proposals.Clear()
+      self.unvoted_proposals.Clear()
+      self.has_voted.Clear()
+
+      if IsPrimaryProposer(self, self.local_epoch):
+        PerformReconciliationWithAll(self)
+
+      # The node may be a voter before, so CancelIfSet() is called outsie "if IsVoter()".
+      CancelIfSet(self.timeout_event)
+      if IsVoter(self, self.local_epoch):
+        self.timeout_event := PostDelayedEvent(ON_TIMEOUT, [self, self.local_epoch], 1min)
+
+    func PerformReconciliationWithAll(self):
+      # Request status from *all* voters.
+      # Pull data if self is behind.
+      # Assume timeout is 6s, call OnCaughtUp(self, self.local_epoch, (self.local_epoch, 0), -1)
+      # when one of the following conditions matches:
+      # * 4s passes
+      # * Have caught up with 2/3 voters and waited 1 more second.
+      # The goal is to increase the chance of making a successful proposal.
+      ...
+
+
+    func PerformReconciliation(self, node):
+      # Request status from node.
+      # Pull data if self is behind.
+      # If self is voter and node is proposer, also pull unnotarized proposals.
+      ...
+
+
+    func OnReceivedHeartbeat(self, status):
+      # status contains the other consensus node's data:
+      # status.e      : local epoch
+      # status.seq    : freshest_notarized_chain[-1].seq
+      if IsStatusBehind(self, status):
+        CatchUp(status.e, status.seq)
+
+
+    func CatchUp(e, freshest_notarized_seq):
+      # Pull data from the other nodes in another thread.
+      # Pulling order (from high to low): epoch, clock message, freshest_notarized_seq.
+      # Updating the epoch is the most important. Many conditions are based on the epoch.
+      # For example, OnReceivedBlock() rejects "blocks from the future".
+      # When all target data have been fetched, call OnCaughtUp().
+      # It's okay to call this function many times. In a real implementation, there will
+      # be another object, ChainSyncer, who is responsible for scheduling the details
+      # of pulling the data.
+      ...
+
+
+    func OnCaughtUp(self, e, seq):
+      if IsPrimaryProposer(self, e):
+        if seq.s == 0:
+          # The callback is triggered from PerformReconciliationWithAll().
+          # This will trigger OnReceivedBlock().
+          StartCreatingNewBlocks(self.blockchain)
+
+      if IsVoter(self, e):
+        # Move data from self.uninserted_proposals to a local variable before calling
+        # OnReceivedProposal(). Expect that self.uninserted_proposals should be empty
+        # after the calls.
+        uninserted_proposals := self.uninserted_proposals
+        self.uninserted_proposals := CreateProposalMap()
+        for p in uninserted_proposals:
+          OnReceivedProposal(self, p, BY_OTHER)
+        # Pull unfinished proposals from the primary proposer.
+        ...
+        # Since we call TryVoting() every time the freshest notarized chain extends,
+        # we don't need to call TryVoting(self) here.
+        # Alternatively, we can stop calling TryVoting() while catching up
+        # and only resume calling TryingVoting() once this callback fires, which is a
+        # possible optimization.
+
+
+    func CreateFreshestNotarizedChain(blockchain, seq) -> notarized_chain:
+      # Implementation notes: seq is a hint to search the only necessary blocks.
+      # Only need to compare the chain which contains block{seq}
+      # Will need take some time to implement this efficiently.
+      # Return the notarized_chain whose sequence number is the largest.
+      ...
+
+
+    func UpdateFinalizedChain(self):
+      # Update the finalized chain.
+      # If finalized chain grows, do the following things:
+      # * Remove unnecessary forks in self.blockchain
+      # * Remove unnecessary votes in self.votes
+      # * Remove unnecessary records in self.has_voted
+      # * Remove unnecessary proposals in self.unnotarized_proposals
+      # * Call OnProposersChanged()/OnVotersChanged() and OnNetworkChanged()
+      #   if there is a new proposer/voter list.
+      #   OnProposersChanged()/OnVotersChanged() updates the states used by
+      #   IsPrimaryProposer() and IsVoter().
+      ...
+
+
+    func StartNetwork():
+      # Implementation notes: manage the network layer.
+      #
+      # Connect to the other consensus nodes if self is a proposer or voter.
+      # Keep sending heartbeat messages to connected nodes.
+      ...
+
+
+    func OnNetworkChanged():
+      # Connect to other consensus nodes if the node becomes a consensus node.
+      # Disconnect from other consensus nodes if the node becomes a non-consensus node.
+      ...
+
+
+    func BroadcastEvent(event):
+      # Send event to all other consensus nodes.
+      ...
+
+
+    func ReliableBroadcastEvent(event):
+      # Send event to all other consensus nodes.
+      # Similar to BroadcastEvent() use a more reliable way of sending events.
+      # In the real implementation, send to all proposers.
+      ...
+
+
+    func SendToPrimaryProposer(event):
+      ...
+
+
+
+The voter-only code (assume it's voter{i})
+------------------------------------------
+
+    # NOTE: Here are the scenarios of calling this function:
+    # 1. OnReceivedProposal: the normal case.
+    # 2. OnFreshestNotarizedChainExtended: the normal case
+    #    or the node received proposals when it is behind.
+    func TryVoting(self):
+      if IsVoter(self, self.local_epoch) == false:
+        return
+
+      # NOTE:
+      # * self.unvoted_proposals stores proposals ordered by seq.
+      # * It is reset after advancing to a new epoch.
+      # * All proposals' blocks are already verified and stored in self.blockchain.
+      unvoted_proposals := self.unvoted_proposals
+      for proposal{seq} in unvoted_proposals:
+        if seq.e != self.local_epoch:
+          # Need to catch up the epoch.
+          break
+
+        if seq.s == 1:
+          block{seq} := GetBlock(proposal{seq})
+          # NOTE: This is slightly different from the paper version.
+          # (point 4, in the section on voting in 5.2 Doubly-Pipelined PaLa)
+          # However, the change should be fine in practice.
+          if GetParent(block{seq}) != self.freshest_notarized_chain[-1]:
+            # Need to catch up blocks and notarizations.
+            break
+        else:
+          if seq.s > K and seq.s - self.freshest_notarized_chain[-1].seq.s > K:
+            # Reach the limit of outstanding window. Need the recent notarizations.
+            break
+
+        if Exists(self.has_voted, seq):
+          Remove(self.unvoted_proposals, seq)
+          continue
+
+        # NOTE: We've verified that the the proposal is signed by the eligible proposer
+        # in OnReceivedProposal().
+        vote{voter{i}, seq} := CreateVote(proposal{seq})
+        Add(self.has_voted, seq)
+        if IsPrimaryProposer(self, seq.e):
+          OnReceivedVote(self, vote{voter{i}, seq})
+        else:
+          SendToPrimaryProposer(vote{voter{i}, seq})
+        Remove(self.unvoted_proposals, seq)
+
+      # If we fail to vote on some `unvoted_proposals`, try to catch up.
+      if NotEmpty(self.unvoted_proposals):
+        seq := self.unvoted_proposals[0].seq
+        CatchUp(seq.e, seq, -1)
+
+
+    func OnTimeout(self, e):
+      if IsVoter(self, e) and e == self.local_epoch:
+        ReliableBroadcastEvent(clock{voter{i}, self.local_epoch + 1})
+
+
+The proposer-only code (assume it's proposer{i})
+------------------------------------------------
+    func StartCreatingNewBlocks(blockchain):
+      # Request blockchain to starts creating new blocks.
+      # When a new block is created, forward it to the consensus node via OnReceivedBlock().
+      # blockchain is responsible to create at least K outstanding unnotarized blocks.
+      # The consensus node is responsible for adding notarizations to the blockchain later.
+      ...
+
+    func StopCreatingNewBlocks(blockchain):
+      # Request blockchain to stops creating new blocks
+      ...
