@@ -10,64 +10,12 @@ import (
 	"thunder2/blockchain"
 	. "thunder2/consensus"
 	"thunder2/network"
+	"thunder2/testutils"
 	"thunder2/utils"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
-
-type config struct {
-	loggingId       string
-	myProposerIds   []string
-	myVoterIds      []string
-	myBootnodeId    string
-	proposerList    blockchain.ElectionResult
-	voterList       blockchain.ElectionResult
-	k               uint32
-	stopBlockNumber uint32
-	reconfigurer    Reconfigurer
-	epochManager    EpochManager
-	timer           Timer
-}
-
-// NOTE: we'll reuse this function in many places (e.g., a benchmark program),
-// so do not access code related to testing.
-func newMediatorForTest(cfg config) (*Mediator, blockchain.BlockChain) {
-	chain, err := blockchain.NewBlockChainFake(cfg.k)
-	if err != nil {
-		utils.Bug("cannot create the chain: err=%s", err)
-	}
-	if cfg.stopBlockNumber > 0 {
-		bcf := chain.(*blockchain.BlockChainFake)
-		bcf.SetStopBlockNumber(cfg.stopBlockNumber)
-	}
-	role := NewRoleAssignerFake(
-		cfg.myProposerIds, cfg.myVoterIds, cfg.myBootnodeId, cfg.proposerList, cfg.voterList)
-	verifier := blockchain.NewVerifierFake(
-		cfg.myProposerIds, cfg.myVoterIds, cfg.proposerList, cfg.voterList)
-	if cfg.reconfigurer == nil {
-		cfg.reconfigurer = NewReconfigurerFake(ReconfigurationConfigFake{})
-	}
-	if cfg.epochManager == nil {
-		cfg.epochManager = NewEpochManagerFake()
-	}
-	if cfg.timer == nil {
-		cfg.timer = NewTimer(cfg.epochManager.GetEpoch())
-	}
-	mediatorCfg := MediatorConfig{
-		LoggingId:        cfg.loggingId,
-		K:                cfg.k,
-		BlockChain:       chain,
-		DataUnmarshaller: &blockchain.DataUnmarshallerFake{},
-		Reconfigurer:     cfg.reconfigurer,
-		EpochManager:     cfg.epochManager,
-		Role:             role,
-		Verifier:         verifier,
-		Selector:         network.ZeroSelector,
-		Timer:            cfg.timer,
-	}
-	return NewMediator(mediatorCfg), chain
-}
 
 // Expect the |mediators| notify FinalizedChainExtendedEvent with sn in range [|beginS|, |endS|]
 // at the same |epoch|.
@@ -153,13 +101,13 @@ func TestLivenessAndDisasterRecovery(t *testing.T) {
 		em := NewEpochManagerFake()
 		cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
 		em.UpdateByClockMsgNota(cNota)
-		mediator, chain := newMediatorForTest(config{
-			loggingId:     "p1",
-			myProposerIds: []string{"p1"},
-			proposerList:  proposerList,
-			voterList:     voterList,
-			k:             k,
-			epochManager:  em,
+		mediator, chain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:     "p1",
+			MyProposerIds: []string{"p1"},
+			ProposerList:  proposerList,
+			VoterList:     voterList,
+			K:             k,
+			EpochManager:  em,
 		})
 		return mediator, chain
 	}
@@ -176,13 +124,13 @@ func TestLivenessAndDisasterRecovery(t *testing.T) {
 		cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
 		em.UpdateByClockMsgNota(cNota)
 		voterEpochManagers = append(voterEpochManagers, em)
-		v, _ := newMediatorForTest(config{
-			loggingId:    id,
-			myVoterIds:   []string{id},
-			proposerList: proposerList,
-			voterList:    voterList,
-			k:            k,
-			epochManager: em,
+		v, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:    id,
+			MyVoterIds:   []string{id},
+			ProposerList: proposerList,
+			VoterList:    voterList,
+			K:            k,
+			EpochManager: em,
 		})
 		voterNotificationChans = append(voterNotificationChans, v.NewNotificationChannel())
 		voters = append(voters, v)
@@ -308,12 +256,12 @@ func TestRoleAuthentication(t *testing.T) {
 	proposerList := blockchain.NewElectionResult([]string{"p1"}, 0, blockchain.Epoch(1))
 	voterList := blockchain.NewElectionResult([]string{"v2"}, 0, blockchain.Epoch(1))
 
-	proposer, _ := newMediatorForTest(config{
-		loggingId:     "p1",
-		myProposerIds: []string{"p1"},
-		proposerList:  proposerList,
-		voterList:     voterList,
-		k:             k,
+	proposer, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:     "p1",
+		MyProposerIds: []string{"p1"},
+		ProposerList:  proposerList,
+		VoterList:     voterList,
+		K:             k,
 	})
 	err := proposer.Start()
 	req.NoError(err)
@@ -321,12 +269,12 @@ func TestRoleAuthentication(t *testing.T) {
 
 	bootnodeId := "b1"
 	blockchain.SetBootnodeIdsForTest([]string{bootnodeId})
-	bootnode, _ := newMediatorForTest(config{
-		loggingId:    bootnodeId,
-		myBootnodeId: bootnodeId,
-		proposerList: proposerList,
-		voterList:    voterList,
-		k:            k,
+	bootnode, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:    bootnodeId,
+		MyBootnodeId: bootnodeId,
+		ProposerList: proposerList,
+		VoterList:    voterList,
+		K:            k,
 	})
 	err = bootnode.Start()
 	req.NoError(err)
@@ -338,12 +286,12 @@ func TestRoleAuthentication(t *testing.T) {
 	var voterNotificationChans []<-chan interface{}
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("v%d", i+1)
-		v, chain := newMediatorForTest(config{
-			loggingId:    id,
-			myVoterIds:   []string{id},
-			proposerList: proposerList,
-			voterList:    voterList,
-			k:            k,
+		v, chain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:    id,
+			MyVoterIds:   []string{id},
+			ProposerList: proposerList,
+			VoterList:    voterList,
+			K:            k,
 		})
 		voters = append(voters, v)
 		voterChains = append(voterChains, chain)
@@ -400,25 +348,25 @@ func TestCatchUpAndVote(t *testing.T) {
 	em.UpdateByClockMsgNota(cNota)
 	proposerList := blockchain.NewElectionResult([]string{"p1"}, 0, epoch)
 	voterList := blockchain.NewElectionResult(voterIds, 0, epoch)
-	proposer, proposerChain := newMediatorForTest(config{
-		loggingId:     "p1",
-		myProposerIds: []string{"p1"},
-		proposerList:  proposerList,
-		voterList:     voterList,
-		k:             k,
-		epochManager:  em,
+	proposer, proposerChain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:     "p1",
+		MyProposerIds: []string{"p1"},
+		ProposerList:  proposerList,
+		VoterList:     voterList,
+		K:             k,
+		EpochManager:  em,
 	})
 	proposerHost := proposer.GetHostForTest()
 	proposerNotificationChan := proposer.NewNotificationChannel()
 
 	em = NewEpochManagerFake()
-	voter, _ := newMediatorForTest(config{
-		loggingId:    "v1",
-		myVoterIds:   []string{"v1"},
-		proposerList: proposerList,
-		voterList:    voterList,
-		k:            k,
-		epochManager: em,
+	voter, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:    "v1",
+		MyVoterIds:   []string{"v1"},
+		ProposerList: proposerList,
+		VoterList:    voterList,
+		K:            k,
+		EpochManager: em,
 	})
 	voterNotificationChan := voter.NewNotificationChannel()
 
@@ -488,14 +436,14 @@ func TestVoterReconfiguration(t *testing.T) {
 		ProposerList:  proposerList,
 		VoterList:     voterList2,
 	})
-	proposer, proposerChain := newMediatorForTest(config{
-		loggingId:       "p1",
-		myProposerIds:   []string{"p1"},
-		proposerList:    proposerList,
-		voterList:       voterList,
-		k:               k,
-		stopBlockNumber: stopBlockNumber,
-		reconfigurer:    r,
+	proposer, proposerChain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:       "p1",
+		MyProposerIds:   []string{"p1"},
+		ProposerList:    proposerList,
+		VoterList:       voterList,
+		K:               k,
+		StopBlockNumber: stopBlockNumber,
+		Reconfigurer:    r,
 	})
 
 	proposerNotificationChan := proposer.NewNotificationChannel()
@@ -510,14 +458,14 @@ func TestVoterReconfiguration(t *testing.T) {
 		ProposerList: proposerList,
 		VoterList:    voterList2,
 	})
-	bootnode, _ := newMediatorForTest(config{
-		loggingId:       bootnodeId,
-		myBootnodeId:    bootnodeId,
-		proposerList:    proposerList,
-		voterList:       voterList,
-		k:               k,
-		stopBlockNumber: stopBlockNumber,
-		reconfigurer:    r,
+	bootnode, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+		LoggingId:       bootnodeId,
+		MyBootnodeId:    bootnodeId,
+		ProposerList:    proposerList,
+		VoterList:       voterList,
+		K:               k,
+		StopBlockNumber: stopBlockNumber,
+		Reconfigurer:    r,
 	})
 	err = bootnode.Start()
 	req.NoError(err)
@@ -549,14 +497,14 @@ func TestVoterReconfiguration(t *testing.T) {
 		})
 		voterReconfiguers = append(voterReconfiguers, r)
 
-		v, chain := newMediatorForTest(config{
-			loggingId:       id,
-			myVoterIds:      []string{id},
-			proposerList:    proposerList,
-			voterList:       voterList,
-			k:               k,
-			stopBlockNumber: stopBlockNumber,
-			reconfigurer:    r,
+		v, chain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:       id,
+			MyVoterIds:      []string{id},
+			ProposerList:    proposerList,
+			VoterList:       voterList,
+			K:               k,
+			StopBlockNumber: stopBlockNumber,
+			Reconfigurer:    r,
 		})
 		voterChains = append(voterChains, chain)
 		voterNotificationChans = append(voterNotificationChans, v.NewNotificationChannel())
@@ -674,24 +622,24 @@ func TestProposerSwitch(t *testing.T) {
 
 		timer := NewTimerFake(1)
 		timer.(*TimerFake).AllowAdvancingEpochTo(3, 50*time.Millisecond)
-		proposer3, proposerChain3 := newMediatorForTest(config{
-			loggingId:     "p3",
-			myProposerIds: []string{"p3"},
-			proposerList:  proposerList,
-			voterList:     voterList,
-			k:             k,
+		proposer3, proposerChain3 := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:     "p3",
+			MyProposerIds: []string{"p3"},
+			ProposerList:  proposerList,
+			VoterList:     voterList,
+			K:             k,
 		})
 		err := proposer3.Start()
 		req.NoError(err)
 		proposerNotificationChan3 := proposer3.NewNotificationChannel()
 
-		voter, _ := newMediatorForTest(config{
-			loggingId:    "v1",
-			myVoterIds:   []string{"v1"},
-			proposerList: proposerList,
-			voterList:    voterList,
-			k:            k,
-			timer:        timer,
+		voter, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+			LoggingId:    "v1",
+			MyVoterIds:   []string{"v1"},
+			ProposerList: proposerList,
+			VoterList:    voterList,
+			K:            k,
+			Timer:        timer,
 		})
 		voterNotificationChan := voter.NewNotificationChannel()
 		err = voter.Start()
@@ -743,12 +691,12 @@ func TestProposerSwitch(t *testing.T) {
 		var proposerNotificationChans []<-chan interface{}
 		for i := 0; i < 2; i++ {
 			id := fmt.Sprintf("p%d", i+1)
-			p, chain := newMediatorForTest(config{
-				loggingId:     id,
-				myProposerIds: []string{id},
-				proposerList:  proposerList,
-				voterList:     voterList,
-				k:             k,
+			p, chain := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+				LoggingId:     id,
+				MyProposerIds: []string{id},
+				ProposerList:  proposerList,
+				VoterList:     voterList,
+				K:             k,
 			})
 
 			err := p.Start()
@@ -767,13 +715,13 @@ func TestProposerSwitch(t *testing.T) {
 			id := fmt.Sprintf("v%d", i+1)
 			timer := NewTimerFake(1)
 			voterTimers = append(voterTimers, timer)
-			v, _ := newMediatorForTest(config{
-				loggingId:    id,
-				myVoterIds:   []string{id},
-				proposerList: proposerList,
-				voterList:    voterList,
-				k:            k,
-				timer:        timer,
+			v, _ := testutils.NewMediatorForTest(testutils.MediatorTestConfig{
+				LoggingId:    id,
+				MyVoterIds:   []string{id},
+				ProposerList: proposerList,
+				VoterList:    voterList,
+				K:            k,
+				Timer:        timer,
 			})
 			voters = append(voters, v)
 
