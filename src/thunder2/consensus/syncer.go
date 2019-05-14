@@ -49,6 +49,12 @@ type ChainSyncerClient interface {
 	OnCaughtUp(id string, s Status)
 }
 
+type SyncerDebugState struct {
+	Status            Status
+	LastRequestId     string
+	LastRequestStatus Status
+}
+
 //--------------------------------------------------------------------
 
 func NewChainSyncer(
@@ -177,6 +183,26 @@ func (c *ChainSyncer) isCaughtUp(r *syncRequest) bool {
 		return true
 	}
 	return false
+}
+
+// Note that ChainSyncer will have its own goroutine, so any getter is async.
+func (c *ChainSyncer) GetDebugState() chan SyncerDebugState {
+	ch := make(chan SyncerDebugState, 1)
+	var max *syncRequest
+	for _, r := range c.requests {
+		if max == nil || r.status.FncBlockSn.Compare(max.status.FncBlockSn) > 0 {
+			max = r
+		}
+	}
+	if max == nil {
+		max = &syncRequest{"n.a.", Status{}}
+	}
+	ch <- SyncerDebugState{
+		Status:            c.status,
+		LastRequestId:     max.id,
+		LastRequestStatus: max.status,
+	}
+	return ch
 }
 
 //--------------------------------------------------------------------

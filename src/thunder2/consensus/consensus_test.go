@@ -380,3 +380,37 @@ func TestCollectingLateVotes(t *testing.T) {
 	req.Equal(firstBlockSn, notas[0].GetBlockSn())
 	req.Equal(voterIds, notas[0].(*blockchain.NotarizationFake).GetVoterIds())
 }
+
+func TestInsertBlockWithoutParent(t *testing.T) {
+	req := require.New(t)
+
+	// Prepare
+	k := uint32(1)
+	proposerList := blockchain.NewElectionResult([]string{"p1"}, 0, blockchain.Epoch(1))
+	voterList := blockchain.NewElectionResult([]string{"v1"}, 0, blockchain.Epoch(1))
+
+	voter, cfg := createNodeForTest(nodeConfigForTest{
+		t:            t,
+		loggingId:    "voter 1",
+		k:            k,
+		myVoterIds:   []string{"v1"},
+		proposerList: proposerList,
+		voterList:    voterList,
+	})
+	voterMediator := cfg.NodeClient.(*NodeClientFake)
+	voter.Start()
+	defer voter.Stop()
+
+	// Simulate how the proposer sends the proposal to the voter
+	dummyMsg := network.Message{}
+	sn := blockchain.BlockSn{Epoch: 1, S: 10}
+	parentSn := blockchain.BlockSn{Epoch: 1, S: 9}
+	b := blockchain.NewBlockFake(sn, parentSn, 11, nil, "data")
+	p := blockchain.NewProposalFake("p1", b)
+	errChan := voter.AddProposal(p, &dummyMsg, BlockCreatedByOther)
+
+	// Expect the voter fails to vote the proposal and requests catching up.
+	req.Error(<-errChan)
+	catchUpSn := <-voterMediator.CatchUpChan
+	req.Equal(parentSn, catchUpSn)
+}

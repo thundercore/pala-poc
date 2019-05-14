@@ -381,6 +381,8 @@ func (n *Node) onReceivedProposal(p blockchain.Proposal, ctx proposalContext) er
 		return nil
 	}
 
+	// TODO(thunder): if b is the first block of this session, check whether
+	// its parent is the stop block in the last session instead.
 	fnb := n.chain.GetFreshestNotarizedChain()
 	fnbs := fnb.GetBlockSn()
 	sn := b.GetBlockSn()

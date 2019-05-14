@@ -17,6 +17,7 @@ type Config struct {
 
 // Estimate a rough lower bound: (2**32-1) / (86400*365) == 136.19 (years)
 // uint32 is large enough.
+// TODO(thunder): add Session and refine the reconfiguration.
 type BlockSn struct {
 	Epoch Epoch
 	S     uint32

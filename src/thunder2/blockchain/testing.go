@@ -111,6 +111,10 @@ type ElectionResult struct {
 
 //--------------------------------------------------------------------
 
+var bootnodeIds []string
+
+//--------------------------------------------------------------------
+
 func NewBlockChainFake(k uint32) (BlockChain, error) {
 	return NewBlockChainFakeWithDelay(k, 0)
 }
@@ -337,6 +341,8 @@ func (bc *BlockChainFake) getDepth(
 }
 
 // TODO(thunder): reject b if it is not extended from b.finalizedChain.
+// Exception: b is the first block of this session,
+// and its parent is the stop block in the last session.
 func (bc *BlockChainFake) InsertBlock(b Block) error {
 	bc.mutex.Lock()
 	defer bc.mutex.Unlock()
@@ -456,6 +462,8 @@ func (bc *BlockChainFake) StartCreatingNewBlocks(epoch Epoch) (chan BlockAndEven
 		return nil, errors.Errorf("is still running")
 	}
 
+	// TODO(thunder): if we are creating the first block of a new session, start from the stop
+	// block in the last session instead.
 	parentSn := bc.getFreshestNotarizedChain().GetBlockSn()
 	pb := bc.getBlock(parentSn)
 	if pb == nil {
@@ -513,6 +521,9 @@ func (bc *BlockChainFake) startWorker(
 				// Simulate the time of creating a new block.
 				<-time.NewTimer(bc.delay).C
 			}
+			// TODO(thunder): Since we'll truncate blocks after the stop block after the
+			// reconfiguration, add no transaction if the new block is after the stop block
+			// in the current session.
 			nb := NewBlockFake(s, parent.GetBlockSn(), parent.GetNumber()+1, notas, s.String())
 			var e *FinalizedChainExtendedEvent
 			bc.mutex.Lock()
@@ -958,6 +969,10 @@ func notarizationsToString(bc BlockChain, notas []Notarization) string {
 
 //--------------------------------------------------------------------
 
+func SetBootnodeIdsForTest(ids []string) {
+	bootnodeIds = ids
+}
+
 func NewVerifierFake(
 	myProposerIds, myVoterIds []string, proposers ElectionResult, voters ElectionResult,
 ) *VerifierFake {
@@ -1199,6 +1214,12 @@ func (v *VerifierFake) doesIdExist(targetId string) bool {
 			if id == targetId {
 				return true
 			}
+		}
+	}
+
+	for i := 0; i < len(bootnodeIds); i++ {
+		if bootnodeIds[i] == targetId {
+			return true
 		}
 	}
 
