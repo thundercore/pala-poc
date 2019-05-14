@@ -7,6 +7,12 @@ import (
 	"thunder2/blockchain"
 	"thunder2/network"
 	"thunder2/utils"
+	"time"
+)
+
+const (
+	// A large value never timeout.
+	forever = 10 * 365 * 24 * time.Hour
 )
 
 // NodeClientFake implements NodeClient and relays Broadcast and Reply calls to MessageChan
@@ -45,8 +51,20 @@ type ReconfigurationConfigFake struct {
 type NetworkCallback func(bc blockchain.BlockChain, host *network.Host) error
 
 type EpochManagerFake struct {
-	mutex sync.Mutex
-	epoch blockchain.Epoch
+	mutex                    sync.Mutex
+	epoch                    blockchain.Epoch
+	clockMsgNota             blockchain.ClockMsgNota
+	nota                     blockchain.Notarization
+	updatedByReconfiguration bool
+}
+
+type TimerFake struct {
+	mutex        utils.CheckedLock
+	timer        *time.Timer
+	duration     time.Duration
+	ch           chan time.Time
+	currentEpoch blockchain.Epoch
+	targetEpoch  blockchain.Epoch
 }
 
 //--------------------------------------------------------------------
@@ -65,13 +83,18 @@ func (m *NodeClientFake) Broadcast(msg blockchain.Message) {
 }
 
 func (m *NodeClientFake) Reply(source *network.Message, msg blockchain.Message) {
-	logger.Debug("[%s] Reply: %T", m.id, msg)
+	logger.Debug("[%s] Reply: %T (%s)", m.id, msg, source.GetSourceDebugInfo())
 	m.MessageChan <- msg
 }
 
 func (m *NodeClientFake) CatchUp(source *network.Message, sn blockchain.BlockSn) {
 	logger.Debug("[%s] CatchUp: %T %s", m.id, source, sn)
 	m.CatchUpChan <- sn
+}
+
+func (m *NodeClientFake) UpdateEpoch(cNota blockchain.ClockMsgNota) {
+	logger.Debug("[%s] UpdateEpoch: %T %d", m.id, cNota.GetEpoch())
+	m.MessageChan <- cNota
 }
 
 //--------------------------------------------------------------------
@@ -114,13 +137,27 @@ func (r *RoleAssignerFake) IsPrimaryProposer(id string, epoch blockchain.Epoch) 
 	if id == "" {
 		id = r.getProposerId(epoch)
 	}
+	primary := r.getPrimaryProposerId(epoch)
+	return primary != "" && id == primary
+}
+
+// A simple round-robin schedule.
+// Let n be the number of proposers and index = "(epoch-1) % n".
+// proposers[index] is the primary proposer.
+func (r *RoleAssignerFake) getPrimaryProposerId(epoch blockchain.Epoch) string {
+	r.mutex.CheckIsLocked("")
+
+	if epoch == 0 {
+		return ""
+	}
+
 	for i := 0; i < len(r.proposerLists); i++ {
-		if r.proposerLists[i].Contain(id, epoch) {
-			// Let the first one always be the primary proposer for now.
-			return id == r.proposerLists[i].GetConsensusIds()[0]
+		if r.proposerLists[i].Contain("", epoch) {
+			proposerIds := r.proposerLists[i].GetConsensusIds()
+			return proposerIds[(int(epoch)-1)%len(proposerIds)]
 		}
 	}
-	return false
+	return ""
 }
 
 func (r *RoleAssignerFake) IsVoter(id string, epoch blockchain.Epoch) bool {
@@ -298,7 +335,8 @@ func (r *ReconfigurerFake) UpdateHost(
 
 func (r *ReconfigurerFake) UpdateEpochManager(bc blockchain.BlockChain, em EpochManager) error {
 	b := bc.GetFreshestNotarizedChain()
-	return em.(*EpochManagerFake).SetEpoch(b.GetBlockSn().Epoch + 1)
+	return em.(*EpochManagerFake).SetEpochDueToReconfiguration(
+		b.GetBlockSn().Epoch + blockchain.Epoch(1))
 }
 
 func (r *ReconfigurerFake) SetNetworkReconfiguration(callback NetworkCallback) {
@@ -322,6 +360,8 @@ func (e *EpochManagerFake) UpdateByClockMsgNota(cn blockchain.ClockMsgNota) erro
 	epoch := cn.GetEpoch()
 	if epoch > e.epoch {
 		e.epoch = epoch
+		e.clockMsgNota = cn
+		e.updatedByReconfiguration = false
 	}
 	return nil
 }
@@ -330,7 +370,32 @@ func (e *EpochManagerFake) UpdateByNotarization(nota blockchain.Notarization) er
 	epoch := nota.GetBlockSn().Epoch
 	if epoch > e.epoch {
 		e.epoch = epoch
+		e.nota = nota
+		e.updatedByReconfiguration = false
 	}
+	return nil
+}
+
+func (e *EpochManagerFake) GetClockMsgNota(epoch blockchain.Epoch) blockchain.ClockMsgNota {
+	if e.clockMsgNota != nil && e.clockMsgNota.GetEpoch() == epoch {
+		return e.clockMsgNota
+	}
+	return nil
+}
+
+func (e *EpochManagerFake) GetNotarization(epoch blockchain.Epoch) blockchain.Notarization {
+	if e.nota != nil && e.nota.GetBlockSn().Epoch == epoch {
+		return e.nota
+	}
+	return nil
+}
+
+func (e *EpochManagerFake) SetEpochDueToReconfiguration(epoch blockchain.Epoch) error {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	e.epoch = epoch
+	e.updatedByReconfiguration = true
 	return nil
 }
 
@@ -340,4 +405,57 @@ func (e *EpochManagerFake) SetEpoch(epoch blockchain.Epoch) error {
 
 	e.epoch = epoch
 	return nil
+}
+
+//--------------------------------------------------------------------
+
+func NewTimerFake(epoch blockchain.Epoch) Timer {
+	t := &TimerFake{
+		currentEpoch: epoch,
+		ch:           make(chan time.Time, 1),
+		timer:        time.NewTimer(forever),
+	}
+	go func() {
+		for {
+			now := <-t.timer.C
+			t.ch <- now
+		}
+	}()
+	t.Reset(epoch)
+	return t
+}
+
+func (t *TimerFake) GetChannel() <-chan time.Time {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	return t.ch
+}
+
+func (t *TimerFake) Reset(epoch blockchain.Epoch) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.reset(epoch)
+}
+
+func (t *TimerFake) reset(epoch blockchain.Epoch) {
+	t.mutex.CheckIsLocked("")
+
+	t.currentEpoch = epoch
+	t.timer.Stop()
+	if t.currentEpoch >= t.targetEpoch {
+		t.timer.Reset(forever)
+	} else {
+		t.timer.Reset(t.duration)
+	}
+}
+
+func (t *TimerFake) AllowAdvancingEpochTo(epoch blockchain.Epoch, d time.Duration) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.targetEpoch = epoch
+	t.duration = d
+
+	t.reset(t.currentEpoch)
 }

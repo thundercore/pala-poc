@@ -8,8 +8,11 @@ import (
 )
 
 type request struct {
-	id         string
-	sn         blockchain.BlockSn
+	id string
+	// Either epoch or sn is set, but both are not set at the same time.
+	epoch blockchain.Epoch
+	sn    blockchain.BlockSn
+	// Used when sn is set.
 	isProposal bool
 }
 
@@ -30,12 +33,16 @@ func newChainSyncerClientFake() *chainSyncerClientFake {
 	}
 }
 
+func (c *chainSyncerClientFake) RequestEpochProof(id string, epoch blockchain.Epoch) {
+	c.requestChan <- request{id, epoch, blockchain.BlockSn{}, false}
+}
+
 func (c *chainSyncerClientFake) RequestNotarizedBlock(id string, sn blockchain.BlockSn) {
-	c.requestChan <- request{id, sn, false}
+	c.requestChan <- request{id, 0, sn, false}
 }
 
 func (c *chainSyncerClientFake) RequestProposal(id string, sn blockchain.BlockSn) {
-	c.requestChan <- request{id, sn, true}
+	c.requestChan <- request{id, 0, sn, true}
 }
 
 func (c *chainSyncerClientFake) OnCaughtUp(id string, s Status) {
@@ -149,12 +156,19 @@ func TestChainSync(t *testing.T) {
 		c := NewChainSyncer("p1", client)
 		epoch := blockchain.Epoch(4)
 		c.SetFreshestNotarizedChainBlockSn(blockchain.BlockSn{Epoch: 1, S: 5})
-		c.SetEpoch(epoch)
 		targetStatus := Status{
 			Epoch:      epoch,
 			FncBlockSn: blockchain.BlockSn{Epoch: epoch, S: 3},
 		}
 		c.CatchUp("v1", targetStatus, CatchUpPolicyMust)
+
+		// Expect ChainSyncer requests ClockNotarization first.
+		r := <-client.requestChan
+		// Expect ChainSyncer requests epoch=4 from v1.
+		req.Equal("v1", r.id)
+		req.Equal(epoch, r.epoch)
+		// Notify ChainSyncer of the progress.
+		c.SetEpoch(epoch)
 
 		// Expect ChainSyncer requests BlockSn{1,6-10}
 		i := uint32(6)
@@ -296,7 +310,7 @@ func TestChainSyncWithDifferentPolicies(t *testing.T) {
 		}
 		req.Equal(targetStatus[1].FncBlockSn.S+1, i)
 
-		// Expect catching up v2 is done
+		// Expect catching up v1 is done
 		d := <-client.doneChan
 		req.Equal("v1", d.id)
 		req.Equal(targetStatus[1], d.status)
@@ -304,7 +318,7 @@ func TestChainSyncWithDifferentPolicies(t *testing.T) {
 }
 
 func TestChainSyncForReconfiguration(t *testing.T) {
-	t.Run("catch up one proposal", func(t *testing.T) {
+	t.Run("catch up different epoch", func(t *testing.T) {
 		req := require.New(t)
 
 		client := newChainSyncerClientFake()
@@ -313,12 +327,13 @@ func TestChainSyncForReconfiguration(t *testing.T) {
 		c.SetFreshestNotarizedChainBlockSn(blockchain.BlockSn{Epoch: 1, S: 4})
 		rfbsn := blockchain.BlockSn{Epoch: 1, S: 6}
 		targetStatus := Status{
-			Epoch:                    1,
+			Epoch:                    2,
 			FncBlockSn:               blockchain.BlockSn{Epoch: 1, S: 5},
 			ReconfFinalizedByBlockSn: rfbsn,
 		}
 		c.CatchUp("v1", targetStatus, CatchUpPolicyMust)
 
+		// Expect not requesting the epoch(2).
 		// Expect requesting the notarized block(1,5)
 		r := <-client.requestChan
 		req.Equal("v1", r.id)
@@ -326,6 +341,66 @@ func TestChainSyncForReconfiguration(t *testing.T) {
 		req.False(r.isProposal)
 		// Notify ChainSyncer of the progress
 		c.SetFreshestNotarizedChainBlockSn(r.sn)
+
+		// Expect requesting the proposal(1,6) to start the reconfiguration.
+		r = <-client.requestChan
+		req.Equal("v1", r.id)
+		req.Equal(rfbsn, r.sn)
+		req.True(r.isProposal)
+		// Notify ChainSyncer of the progress
+		c.SetReceivedProposalBlockSn(r.sn)
+
+		// Expect catching up v1 is done
+		d := <-client.doneChan
+		req.Equal("v1", d.id)
+		req.Equal(targetStatus, d.status)
+	})
+
+	t.Run("catch up different epoch with a timeout block", func(t *testing.T) {
+		req := require.New(t)
+
+		// Simulate catching up from (1,4) to the chain: (1,4) -> (2,1) -> ... (2,5)
+		client := newChainSyncerClientFake()
+		c := NewChainSyncer("p1", client)
+		c.SetEpoch(1)
+		c.SetFreshestNotarizedChainBlockSn(blockchain.BlockSn{Epoch: 1, S: 4})
+		rfbsn := blockchain.BlockSn{Epoch: 2, S: 6}
+		targetStatus := Status{
+			Epoch:                    3,
+			FncBlockSn:               blockchain.BlockSn{Epoch: 2, S: 5},
+			ReconfFinalizedByBlockSn: rfbsn,
+		}
+		c.CatchUp("v1", targetStatus, CatchUpPolicyMust)
+
+		// Expect requesting the epoch(2)
+		r := <-client.requestChan
+		req.Equal("v1", r.id)
+		req.Equal(blockchain.Epoch(2), r.epoch)
+		// Notify ChainSyncer of the progress
+		c.SetEpoch(blockchain.Epoch(2))
+
+		// Expect requesting the notarized block(1,5)
+		r = <-client.requestChan
+		req.Equal("v1", r.id)
+		req.Equal(blockchain.BlockSn{Epoch: 1, S: 5}, r.sn)
+		req.False(r.isProposal)
+		// Notify ChainSyncer of the progress
+		c.SetBlockNotExisted(r.sn)
+
+		// Expect requesting the notarized block(2,1-5)
+		i := uint32(1)
+		for r := range client.requestChan {
+			req.Equal("v1", r.id)
+			req.Equal(blockchain.BlockSn{Epoch: blockchain.Epoch(2), S: i}, r.sn)
+			req.False(r.isProposal)
+			// Notify ChainSyncer of the progress
+			c.SetFreshestNotarizedChainBlockSn(r.sn)
+			i++
+			if i > 5 {
+				break
+			}
+		}
+		req.Equal(uint32(6), i)
 
 		// Expect requesting the proposal(1,6) to start the reconfiguration.
 		r = <-client.requestChan

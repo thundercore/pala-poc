@@ -11,6 +11,7 @@ import (
 	. "thunder2/consensus"
 	"thunder2/network"
 	"thunder2/utils"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +27,7 @@ type config struct {
 	stopBlockNumber uint32
 	reconfigurer    Reconfigurer
 	epochManager    EpochManager
+	timer           Timer
 }
 
 // NOTE: we'll reuse this function in many places (e.g., a benchmark program),
@@ -49,6 +51,9 @@ func newMediatorForTest(cfg config) (*Mediator, blockchain.BlockChain) {
 	if cfg.epochManager == nil {
 		cfg.epochManager = NewEpochManagerFake()
 	}
+	if cfg.timer == nil {
+		cfg.timer = NewTimer(cfg.epochManager.GetEpoch())
+	}
 	mediatorCfg := MediatorConfig{
 		LoggingId:        cfg.loggingId,
 		K:                cfg.k,
@@ -59,6 +64,7 @@ func newMediatorForTest(cfg config) (*Mediator, blockchain.BlockChain) {
 		Role:             role,
 		Verifier:         verifier,
 		Selector:         network.ZeroSelector,
+		Timer:            cfg.timer,
 	}
 	return NewMediator(mediatorCfg), chain
 }
@@ -145,7 +151,8 @@ func TestLivenessAndDisasterRecovery(t *testing.T) {
 	voterList := blockchain.NewElectionResult(voterIds, 0, blockchain.Epoch(2))
 	newProposer := func(epoch blockchain.Epoch) (*Mediator, blockchain.BlockChain) {
 		em := NewEpochManagerFake()
-		em.(*EpochManagerFake).SetEpoch(epoch)
+		cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
+		em.UpdateByClockMsgNota(cNota)
 		mediator, chain := newMediatorForTest(config{
 			loggingId:     "p1",
 			myProposerIds: []string{"p1"},
@@ -166,7 +173,8 @@ func TestLivenessAndDisasterRecovery(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("v%d", i+1)
 		em := NewEpochManagerFake()
-		em.(*EpochManagerFake).SetEpoch(epoch)
+		cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
+		em.UpdateByClockMsgNota(cNota)
 		voterEpochManagers = append(voterEpochManagers, em)
 		v, _ := newMediatorForTest(config{
 			loggingId:    id,
@@ -223,13 +231,12 @@ func TestLivenessAndDisasterRecovery(t *testing.T) {
 		req := require.New(t)
 
 		// Manually update the epoch so that the proposer will propose (2,1)
-		// after performing reconciliation. This is a workaround to make the test pass,
-		// and we won't need this after the timeout and clock are implemented because
-		// nodes will automatically advance the epoch after the timeout.
-		// TODO(thunder): remove this workaround after the timeout and clock are implemented.
+		// after performing reconciliation. To test this case many times in a short time,
+		// this necessary to reduce the waiting time to send clock messages.
 		epoch++
+		cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
 		for _, em := range voterEpochManagers {
-			em.(*EpochManagerFake).SetEpoch(epoch)
+			em.UpdateByClockMsgNota(cNota)
 		}
 
 		// Create a new proposer to simulate wiping out the proposer's data.
@@ -387,9 +394,10 @@ func TestCatchUpAndVote(t *testing.T) {
 	req := require.New(t)
 	k := uint32(2)
 	epoch := blockchain.Epoch(2)
-	em := NewEpochManagerFake()
-	em.(*EpochManagerFake).SetEpoch(epoch)
 	voterIds := []string{"v1"}
+	em := NewEpochManagerFake()
+	cNota := blockchain.NewClockMsgNotaFake(epoch, voterIds)
+	em.UpdateByClockMsgNota(cNota)
 	proposerList := blockchain.NewElectionResult([]string{"p1"}, 0, epoch)
 	voterList := blockchain.NewElectionResult(voterIds, 0, epoch)
 	proposer, proposerChain := newMediatorForTest(config{
@@ -462,8 +470,8 @@ func TestVoterReconfiguration(t *testing.T) {
 	// * Expect v2 continues in office.
 
 	k := uint32(2)
-	// The 11th block's sn is (1,10) because (0,1) is the first block.
-	stopBlockNumber := uint32(11)
+	// Note that the genesis block is the 0th block.
+	stopBlockNumber := uint32(10)
 	voterIds := [][]string{
 		[]string{"v1", "v2"},
 		[]string{"v2", "v3"},
@@ -586,7 +594,7 @@ func TestVoterReconfiguration(t *testing.T) {
 	}
 
 	// Verify
-	end := stopBlockNumber - 1 // 10
+	end := stopBlockNumber
 	verifyFinalizedChain(
 		t, proposer.GetLoggingId(), proposerNotificationChan, 1, 1, end, true, nil)
 	verifyFinalizedChain(
@@ -650,6 +658,213 @@ func TestVoterReconfiguration(t *testing.T) {
 		req.Equal("v2", voterIds[0], "sn=%s, voterIds=%s", sn, voterIds)
 		req.Equal("v3", voterIds[1], "sn=%s, voterIds=%s", sn, voterIds)
 	}
+}
+
+func TestProposerSwitch(t *testing.T) {
+	k := uint32(2)
+
+	// TODO(thunder): think how to make this test more reliable.
+	t.Run("simple case", func(t *testing.T) {
+		req := require.New(t)
+
+		// Prepare one proposer and one voter. The proposer becomes the primary one at epoch 3.
+		proposerList := blockchain.NewElectionResult(
+			[]string{"p1", "p2", "p3"}, 0, blockchain.Epoch(10))
+		voterList := blockchain.NewElectionResult([]string{"v1"}, 0, blockchain.Epoch(10))
+
+		timer := NewTimerFake(1)
+		timer.(*TimerFake).AllowAdvancingEpochTo(3, 50*time.Millisecond)
+		proposer3, proposerChain3 := newMediatorForTest(config{
+			loggingId:     "p3",
+			myProposerIds: []string{"p3"},
+			proposerList:  proposerList,
+			voterList:     voterList,
+			k:             k,
+		})
+		err := proposer3.Start()
+		req.NoError(err)
+		proposerNotificationChan3 := proposer3.NewNotificationChannel()
+
+		voter, _ := newMediatorForTest(config{
+			loggingId:    "v1",
+			myVoterIds:   []string{"v1"},
+			proposerList: proposerList,
+			voterList:    voterList,
+			k:            k,
+			timer:        timer,
+		})
+		voterNotificationChan := voter.NewNotificationChannel()
+		err = voter.Start()
+		req.NoError(err)
+
+		network.FakeConnect(voter.GetHostForTest(), proposer3.GetHostForTest())
+
+		// Register the debug helper.
+		var mediators []*Mediator
+		mediators = append(mediators, proposer3, voter)
+
+		signalChan := registerDumpDebugStateHandler(mediators)
+		defer stopSignalHandler(signalChan)
+
+		// Expect the liveness starts at epoch=3.
+		verifyFinalizedChain(
+			t, proposer3.GetLoggingId(), proposerNotificationChan3, 3, 1, 10, true, nil)
+		verifyFinalizedChain(
+			t, voter.GetLoggingId(), voterNotificationChan, 3, 1, 10, true, nil)
+
+		b := proposerChain3.GetBlock(blockchain.BlockSn{Epoch: 3, S: 1})
+		req.NotNil(b)
+		parentSn := b.GetParentBlockSn()
+		req.Equal(blockchain.GetGenesisBlockSn(), parentSn)
+
+		// Stop proposers/voters.
+		for _, m := range mediators {
+			err = m.Stop()
+			req.NoError(err)
+			err = m.Wait()
+			req.NoError(err)
+		}
+	})
+
+	// TODO(thunder): think how to make this test more reliable.
+	t.Run("switch to another and switch back to the original one", func(t *testing.T) {
+		req := require.New(t)
+
+		//
+		// Prepare two proposers and three voters.
+		//
+		k := uint32(2)
+		proposerList := blockchain.NewElectionResult([]string{"p1", "p2"}, 0, blockchain.Epoch(10))
+		voterList := blockchain.NewElectionResult([]string{"v1", "v2", "v3"}, 0, blockchain.Epoch(10))
+
+		// Prepare two proposers
+		var proposers []*Mediator
+		var proposerChains []blockchain.BlockChain
+		var proposerNotificationChans []<-chan interface{}
+		for i := 0; i < 2; i++ {
+			id := fmt.Sprintf("p%d", i+1)
+			p, chain := newMediatorForTest(config{
+				loggingId:     id,
+				myProposerIds: []string{id},
+				proposerList:  proposerList,
+				voterList:     voterList,
+				k:             k,
+			})
+
+			err := p.Start()
+			req.NoError(err)
+
+			proposers = append(proposers, p)
+			proposerChains = append(proposerChains, chain)
+			proposerNotificationChans = append(
+				proposerNotificationChans, p.NewNotificationChannel())
+		}
+
+		// Prepare three voters
+		var voterTimers []Timer
+		var voters []*Mediator
+		for i := 0; i < 3; i++ {
+			id := fmt.Sprintf("v%d", i+1)
+			timer := NewTimerFake(1)
+			voterTimers = append(voterTimers, timer)
+			v, _ := newMediatorForTest(config{
+				loggingId:    id,
+				myVoterIds:   []string{id},
+				proposerList: proposerList,
+				voterList:    voterList,
+				k:            k,
+				timer:        timer,
+			})
+			voters = append(voters, v)
+
+			err := v.Start()
+			req.NoError(err)
+		}
+
+		// Register the debug helper.
+		var mediators []*Mediator
+		mediators = append(mediators, proposers...)
+		mediators = append(mediators, voters...)
+
+		signalChan := registerDumpDebugStateHandler(mediators)
+		defer stopSignalHandler(signalChan)
+
+		//
+		// Prepare network connections.
+		//
+		// Simulate that p1 is offline after (1,10) is notarized.
+		// Expect p2 takes over afterward.
+		net := NewNetworkSimulator()
+		net.AddRule(NetworkSimulatorRule{
+			From: []string{"p1"},
+			To:   nil,
+			Type: blockchain.TypeNotarization,
+			Sn:   blockchain.BlockSn{Epoch: 1, S: 10},
+			Action: &network.FilterAction{
+				PostCallback: func(from string, to string, typ uint8, blob []byte) network.PassedOrDropped {
+					for _, timer := range voterTimers {
+						timer.(*TimerFake).AllowAdvancingEpochTo(2, 50*time.Millisecond)
+					}
+					return network.Dropped
+				},
+			},
+		})
+		// Simulate that p1 is online after (2,1)
+		net.AddRule(NetworkSimulatorRule{
+			From: []string{"p2"},
+			To:   []string{"v1"},
+			Type: blockchain.TypeNotarization,
+			Sn:   blockchain.BlockSn{Epoch: 2, S: 1},
+			Action: &network.FilterAction{
+				PostCallback: func(from string, to string, typ uint8, blob []byte) network.PassedOrDropped {
+					net.Connect(proposers[0].GetHostForTest(), proposers[1].GetHostForTest())
+					for _, v := range voters {
+						net.Connect(v.GetHostForTest(), proposers[0].GetHostForTest())
+					}
+					return network.Passed
+				},
+			},
+		})
+		// Simulate that p2 is offline after (2,10) is notarized.
+		// Expect p1 takes over afterward.
+		net.AddRule(NetworkSimulatorRule{
+			From: []string{"p2"},
+			To:   nil,
+			Type: blockchain.TypeNotarization,
+			Sn:   blockchain.BlockSn{Epoch: 2, S: 10},
+			Action: &network.FilterAction{
+				PostCallback: func(from string, to string, typ uint8, blob []byte) network.PassedOrDropped {
+					for _, timer := range voterTimers {
+						timer.(*TimerFake).AllowAdvancingEpochTo(3, 50*time.Millisecond)
+					}
+					return network.Dropped
+				},
+			},
+		})
+		// Connect hosts.
+		net.Connect(proposers[1].GetHostForTest(), proposers[0].GetHostForTest())
+		for _, v := range voters {
+			for _, p := range proposers {
+				net.Connect(v.GetHostForTest(), p.GetHostForTest())
+			}
+		}
+
+		// Test
+		loggingId := proposers[0].GetLoggingId()
+		ch := proposerNotificationChans[0]
+		chain := proposerChains[0]
+		verifyFinalizedChain(t, loggingId, ch, 1, 1, 10-2*k, true, chain)
+		verifyFinalizedChain(t, loggingId, ch, 2, 1, 10-2*k, true, chain)
+		verifyFinalizedChain(t, loggingId, ch, 3, 1, 10, true, chain)
+
+		// Stop proposers/voters.
+		for _, m := range mediators {
+			err := m.Stop()
+			req.NoError(err)
+			err = m.Wait()
+			req.NoError(err)
+		}
+	})
 }
 
 // TODO(thunder): test a voter is much behind and hard to catch up?

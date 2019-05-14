@@ -121,7 +121,7 @@ func NewBlockChainFake(k uint32) (BlockChain, error) {
 
 func NewBlockChainFakeWithDelay(k uint32, delay time.Duration) (BlockChain, error) {
 	sn := GetGenesisBlockSn()
-	genesis := NewBlockFake(sn, BlockSn{}, 1, nil, "0")
+	genesis := NewBlockFake(sn, BlockSn{}, 0, nil, "0")
 	bc := BlockChainFake{
 		blocks:  make(map[BlockSn]Block),
 		genesis: genesis,

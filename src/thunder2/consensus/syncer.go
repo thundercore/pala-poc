@@ -35,8 +35,7 @@ var (
 )
 
 type syncRequest struct {
-	id string
-	// TODO(thunder): sync Status.Epoch
+	id     string
 	status Status
 }
 
@@ -44,6 +43,7 @@ type syncRequest struct {
 // If ChainSyncer really needs to know whether the execution succeeds, use some other way
 // to get the result.
 type ChainSyncerClient interface {
+	RequestEpochProof(id string, epoch blockchain.Epoch)
 	RequestNotarizedBlock(id string, sn blockchain.BlockSn)
 	RequestProposal(id string, sn blockchain.BlockSn)
 	OnCaughtUp(id string, s Status)
@@ -87,6 +87,7 @@ func (c *ChainSyncer) SetEpoch(epoch blockchain.Epoch) error {
 		return errors.Errorf("update smaller epoch: %d < %d", epoch, c.status.Epoch)
 	}
 	c.status.Epoch = epoch
+	c.requestNextBlock(false)
 	return nil
 }
 
@@ -114,7 +115,6 @@ func (c *ChainSyncer) Stop() error {
 	return nil
 }
 
-// TODO(thunder): catching up epoch.
 func (c *ChainSyncer) CatchUp(id string, s Status, policy CatchUpPolicy) error {
 	if _, ok := c.requests[id]; policy == CatchUpPolicyMust || !ok {
 		c.requests[id] = &syncRequest{id, s}
@@ -125,7 +125,21 @@ func (c *ChainSyncer) CatchUp(id string, s Status, policy CatchUpPolicy) error {
 	return nil
 }
 
+func (c *ChainSyncer) CancelCatchingUp(id string) error {
+	delete(c.requests, id)
+	c.requestNextBlock(false)
+	return nil
+}
+
 func (c *ChainSyncer) requestNextBlock(lastRequestNotExisted bool) {
+	// Check epoch first.
+	id, epoch := c.findEpochForRequest()
+	if id != "" {
+		c.client.RequestEpochProof(id, epoch)
+		return
+	}
+
+	// Check freshest notarized block.
 	r := c.findClosestRequest()
 	if r == nil {
 		return
@@ -151,6 +165,28 @@ func (c *ChainSyncer) requestNextBlock(lastRequestNotExisted bool) {
 	} else {
 		c.client.RequestNotarizedBlock(r.id, sn)
 	}
+}
+
+func (c *ChainSyncer) findEpochForRequest() (string, blockchain.Epoch) {
+	maxEpoch := c.status.Epoch
+	var max *syncRequest
+	for _, r := range c.requests {
+		epoch := r.status.Epoch
+		if !r.status.ReconfFinalizedByBlockSn.IsNil() {
+			// There is no simple proof of r.status.Epoch.
+			// The node will get the complete proof after it catches up r,
+			// so catch up the last block's epoch first.
+			epoch = r.status.ReconfFinalizedByBlockSn.Epoch
+		}
+		if epoch > maxEpoch {
+			max = r
+			maxEpoch = epoch
+		}
+	}
+	if max != nil {
+		return max.id, maxEpoch
+	}
+	return "", blockchain.Epoch(0)
 }
 
 func (c *ChainSyncer) findClosestRequest() *syncRequest {

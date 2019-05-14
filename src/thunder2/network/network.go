@@ -349,8 +349,6 @@ func (h *Host) removeConnection(cc connection) {
 			return
 		}
 	}
-	logger.Error("[%s] neither hubs nor spokes contain the connection: (%s)",
-		h.id, cc.getDebugInfo())
 }
 
 func (h *Host) GetTLSPublicKey(handle ConnectionHandle) []byte {

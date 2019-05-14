@@ -20,6 +20,7 @@ type nodeConfigForTest struct {
 	proposerList  blockchain.ElectionResult
 	voterList     blockchain.ElectionResult
 	blockDelay    time.Duration
+	timer         Timer
 }
 
 var (
@@ -31,6 +32,11 @@ func createNodeForTest(cfg nodeConfigForTest) (*Node, NodeConfig) {
 	chain, err := blockchain.NewBlockChainFakeWithDelay(cfg.k, cfg.blockDelay)
 	require.NoError(cfg.t, err)
 
+	epoch := blockchain.Epoch(1)
+	if cfg.timer == nil {
+		cfg.timer = NewTimer(epoch)
+	}
+
 	nodeCfg := NodeConfig{
 		LoggingId:  cfg.loggingId,
 		K:          cfg.k,
@@ -38,6 +44,8 @@ func createNodeForTest(cfg nodeConfigForTest) (*Node, NodeConfig) {
 		NodeClient: nc,
 		Role:       NewRoleAssignerFake(cfg.myProposerIds, cfg.myVoterIds, "", cfg.proposerList, cfg.voterList),
 		Verifier:   blockchain.NewVerifierFake(cfg.myProposerIds, cfg.myVoterIds, cfg.proposerList, cfg.voterList),
+		Epoch:      epoch,
+		Timer:      cfg.timer,
 	}
 	n := NewNode(nodeCfg)
 	return &n, nodeCfg
@@ -268,6 +276,8 @@ func TestVotingWithInconsistentView(t *testing.T) {
 	//
 	// Create a new proposal based on a new block.
 	epoch++
+	proposer.SetEpoch(epoch)
+	voter.SetEpoch(epoch)
 
 	ps := blockchain.BlockSn{Epoch: 1, S: 5}
 	proposerChain.AddNotarization(blockchain.NewNotarizationFake(ps, voterIds))
@@ -413,4 +423,121 @@ func TestInsertBlockWithoutParent(t *testing.T) {
 	req.Error(<-errChan)
 	catchUpSn := <-voterMediator.CatchUpChan
 	req.Equal(parentSn, catchUpSn)
+}
+
+func TestAdvancingLocalEpoch(t *testing.T) {
+	req := require.New(t)
+
+	// Prepare
+	epoch := blockchain.Epoch(1)
+	k := uint32(1)
+	proposerList := blockchain.NewElectionResult([]string{"p1", "p2"}, 0, blockchain.Epoch(10))
+	voterList := blockchain.NewElectionResult([]string{"v1"}, 0, blockchain.Epoch(10))
+
+	// Use a shorten timer to reduce the testing time.
+	proposer2, cfg := createNodeForTest(nodeConfigForTest{
+		t:             t,
+		loggingId:     "proposer 1",
+		k:             k,
+		myProposerIds: []string{"p2"},
+		proposerList:  proposerList,
+		voterList:     voterList,
+		timer:         NewTimer(epoch),
+	})
+	proposerMediator2 := cfg.NodeClient.(*NodeClientFake)
+	proposerChain := cfg.Chain
+	proposer2.Start()
+	defer proposer2.Stop()
+
+	timer := NewTimerFake(epoch)
+	timer.(*TimerFake).AllowAdvancingEpochTo(epoch+blockchain.Epoch(1), 50*time.Millisecond)
+	voter, cfg := createNodeForTest(nodeConfigForTest{
+		t:            t,
+		loggingId:    "voter 1",
+		k:            k,
+		myVoterIds:   []string{"v1"},
+		proposerList: proposerList,
+		voterList:    voterList,
+		timer:        timer,
+	})
+	voterMediator := cfg.NodeClient.(*NodeClientFake)
+	voterChain := cfg.Chain
+	voter.Start()
+	defer voter.Stop()
+
+	//
+	// Test
+	//
+	epoch++
+	// Expect a timeout happens and the voter broadcasts a ClockMsg.
+	m := <-voterMediator.MessageChan
+	c, ok := m.(*blockchain.ClockMsgFake)
+	req.True(ok, m)
+	req.Equal(epoch, c.GetEpoch())
+
+	errChan := proposer2.AddClockMsg(c)
+	req.NoError(<-errChan)
+
+	// Expect the proposer creates and broadcasts the clock message notarization.
+	m = <-proposerMediator2.MessageChan
+	cNota, ok := m.(*blockchain.ClockMsgNotaFake)
+	req.True(ok, m)
+	req.Equal(epoch, cNota.GetEpoch())
+
+	// Expect the proposer updates clock message notarization.
+	m = <-proposerMediator2.MessageChan
+	cNota, ok = m.(*blockchain.ClockMsgNotaFake)
+	req.True(ok, m)
+	req.Equal(epoch, cNota.GetEpoch())
+	proposer2.SetEpoch(epoch)
+
+	// Pass the clock message notarization to the voter.
+	errChan = voter.AddClockMsgNota(cNota)
+	req.NoError(<-errChan)
+	m = <-voterMediator.MessageChan
+	cNota, ok = m.(*blockchain.ClockMsgNotaFake)
+	req.True(ok, m)
+	voter.SetEpoch(cNota.GetEpoch())
+
+	// Simulate how the proposer receives a block from the blockchain
+	// and make a new proposal.
+	ch, err := proposerChain.StartCreatingNewBlocks(epoch)
+	req.NoError(err)
+	b := (<-ch).Block
+
+	// Add a block to the proposing node. Expect to see the node broadcasts a proposal.
+	errChan = proposer2.AddBlock(b, BlockCreatedBySelf)
+	req.NoError(<-errChan)
+	m = <-proposerMediator2.MessageChan
+	p, ok := m.(*blockchain.ProposalFake)
+	req.True(ok, m)
+
+	// Simulate how the proposer sends the proposal to the voter
+	// and receives the vote from the voter.
+	dummyMsg := network.Message{}
+	errChan = voter.AddProposal(p, &dummyMsg, BlockCreatedByOther)
+	req.NoError(<-errChan)
+	m = <-voterMediator.MessageChan
+	v, ok := m.(*blockchain.VoteFake)
+	req.True(ok, m)
+
+	errChan = proposer2.AddVote(v)
+	req.NoError(<-errChan)
+
+	// Expect the proposer creates and broadcasts the notarization.
+	m = <-proposerMediator2.MessageChan
+	nota, ok := m.(*blockchain.NotarizationFake)
+	req.True(ok, m)
+
+	errChan = voter.AddNotarization(nota)
+	req.NoError(<-errChan)
+
+	// Expect the freshest notarized chain is extended.
+	bc := proposerChain
+	actual := bc.GetFreshestNotarizedChain()
+	req.Equal("0[]->(2,1)[]", blockchain.DumpFakeChain(bc, actual, true))
+
+	bc = voterChain
+	actual = bc.GetFreshestNotarizedChain()
+	req.Equal("0[]->(2,1)[]", blockchain.DumpFakeChain(bc, actual, true))
 }

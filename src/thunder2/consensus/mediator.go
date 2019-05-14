@@ -1,16 +1,21 @@
 package consensus
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"thunder2/blockchain"
 	"thunder2/network"
 	"thunder2/utils"
+	"time"
 
 	"github.com/petar/GoLLRB/llrb"
 	"github.com/pkg/errors"
 )
+
+var delayOfMakingFirstProposal = 1000
 
 type MediatorConfig struct {
 	LoggingId        string
@@ -22,6 +27,7 @@ type MediatorConfig struct {
 	Reconfigurer     Reconfigurer
 	EpochManager     EpochManager
 	Selector         func() int
+	Timer            Timer
 }
 
 // TODO(thunder): Mediator must try to connect disconnected consensus nodes periodically.
@@ -53,25 +59,35 @@ type Mediator struct {
 	//
 	// Only used in worker goroutine
 	//
-	syncer                   *ChainSyncer
-	chain                    blockchain.BlockChain
-	selfChan                 chan interface{}
-	messageChan              chan *network.Message
-	blockChan                chan blockchain.BlockAndEvent
-	blockChainEventChan      <-chan interface{}
-	verifier                 blockchain.Verifier
-	node                     *Node
-	unmarshaller             blockchain.DataUnmarshaller
-	reconfigurer             Reconfigurer
-	epochManager             EpochManager
-	connections              map[string]network.ConnectionHandle
-	handshakeStates          map[network.ConnectionHandle]handshakeState
+	syncer              *ChainSyncer
+	chain               blockchain.BlockChain
+	selfChan            chan interface{}
+	messageChan         chan *network.Message
+	blockChan           chan blockchain.BlockAndEvent
+	blockChainEventChan <-chan interface{}
+	// Only use verifier for challenge-response authentication. Let node verify consensus data.
+	verifier     blockchain.Verifier
+	node         *Node
+	unmarshaller blockchain.DataUnmarshaller
+	reconfigurer Reconfigurer
+	// About epoch management:
+	// * Mediator owns EpochManager and is responsible to update and save the epoch using EpochManager.
+	// * To make Node's decision be consistent in a work, update Node's epoch asynchronously.
+	//   Do not let Node share EpochManager; otherwise, it's hard to prevent Node from using
+	//   different epochs while processing the same work.
+	epochManager                   EpochManager
+	connections                    map[string]network.ConnectionHandle
+	handshakeStates                map[network.ConnectionHandle]handshakeState
+	reconciliationWithAllBeginTime time.Time
+	// consensus nodes which we have the consistent view.
 	syncedIds                map[string]bool
 	unnotarizedProposals     map[blockchain.BlockSn]blockchain.Proposal
 	reconfFinalizedByBlockSn blockchain.BlockSn
 	// Used to catch up the reconfiguration block.
 	// key: BlockSn, value: Proposal
 	recentProposals *llrb.LLRB
+	// For debug purpose.
+	lastBroadcastedProposal blockchain.BlockSn
 
 	//
 	// Used in multiple goroutines
@@ -93,6 +109,8 @@ type EpochManager interface {
 	GetEpoch() blockchain.Epoch
 	UpdateByClockMsgNota(cn blockchain.ClockMsgNota) error
 	UpdateByNotarization(nota blockchain.Notarization) error
+	GetClockMsgNota(epoch blockchain.Epoch) blockchain.ClockMsgNota
+	GetNotarization(epoch blockchain.Epoch) blockchain.Notarization
 }
 
 type FreshestNotarizedChainExtendedEvent struct {
@@ -136,6 +154,11 @@ const (
 	TypeRespondProposalNotExisted       = Type(0x89)
 	TypeRequestUnnotarizedProposals     = Type(0x8a)
 	TypeRespondUnnotarizedProposals     = Type(0x8b)
+	TypeRequestEpoch                    = Type(0x8c)
+	TypeRespondEpochByClockMsgNota      = Type(0x8d)
+	TypeRespondEpochByNotarization      = Type(0x8e)
+	TypeRespondEpochNotExisted          = Type(0x8f)
+	TypeRespondEpochInvalid             = Type(0x90)
 )
 
 // Status represents the node's main states. Nodes will exchange their
@@ -150,12 +173,14 @@ type Status struct {
 }
 
 type DebugState struct {
-	Identity          string
-	Status            Status
-	SyncerState       SyncerDebugState
-	SyncedIds         []string
-	MinRecentProposal blockchain.BlockSn
-	MaxRecentProposal blockchain.BlockSn
+	Identity             string
+	Status               Status
+	SyncerState          SyncerDebugState
+	SyncedIds            []string
+	ConnectedIds         []string
+	ProposalInfo         string
+	IsMakingBlock        bool
+	LastBroadcastedBlock blockchain.BlockSn
 }
 
 // TODO(thunder): Check protocol version in the beginning.
@@ -201,7 +226,14 @@ type catchUpStatusEvent struct {
 }
 
 type startCreatingBlocksEvent struct {
-	expectMayBeRunning bool
+}
+
+type reconciliationWithAllEvent struct {
+}
+
+type requestEpochProofEvent struct {
+	id    string
+	epoch blockchain.Epoch
 }
 
 type requestDataEvent struct {
@@ -218,6 +250,13 @@ type onCaughtUpEvent struct {
 // Types used with selfChan - End
 
 //--------------------------------------------------------------------
+
+func init() {
+	if flag.Lookup("test.v") != nil {
+		// Speed up the test.
+		delayOfMakingFirstProposal = 50
+	}
+}
 
 func IsSyncMessage(v uint8) bool {
 	return v&0x80 > 0
@@ -247,6 +286,16 @@ func (typ Type) String() string {
 		return "TypeRequestUnnotarizedProposals"
 	case TypeRespondUnnotarizedProposals:
 		return "TypeRespondUnnotarizedProposals"
+	case TypeRequestEpoch:
+		return "TypeRequestEpoch"
+	case TypeRespondEpochByClockMsgNota:
+		return "TypeRespondEpochByClockMsgNota"
+	case TypeRespondEpochByNotarization:
+		return "TypeRespondEpochByNotarization"
+	case TypeRespondEpochNotExisted:
+		return "TypeRespondEpochNotExisted"
+	case TypeRespondEpochInvalid:
+		return "TypeRespondEpochInvalid"
 	default:
 		return "unknown"
 	}
@@ -268,14 +317,13 @@ func hsStateToString(s handshakeState) string {
 func NewMediator(cfg MediatorConfig) *Mediator {
 	if len(cfg.LoggingId) == 0 || cfg.K == 0 || cfg.BlockChain == nil ||
 		cfg.Role == nil || cfg.Verifier == nil || cfg.DataUnmarshaller == nil ||
-		cfg.Reconfigurer == nil || cfg.Selector == nil {
+		cfg.Reconfigurer == nil || cfg.Selector == nil || cfg.Timer == nil {
 		logger.Error("NewMediator: must fill all fields in MediatorConfig")
 		return nil
 	}
 	nr := network.RoleSpoke
-	// TODO(thunder): use local epoch stored on the disk.
-	fnc := cfg.BlockChain.GetFreshestNotarizedChain()
-	if cfg.Role.IsProposer("", fnc.GetBlockSn().Epoch) ||
+	epoch := cfg.EpochManager.GetEpoch()
+	if cfg.Role.IsProposer("", epoch) ||
 		cfg.Role.IsBootnode("") {
 		nr = network.RoleHub
 	}
@@ -305,6 +353,8 @@ func NewMediator(cfg MediatorConfig) *Mediator {
 		NodeClient: &m,
 		Role:       cfg.Role,
 		Verifier:   cfg.Verifier,
+		Epoch:      cfg.EpochManager.GetEpoch(),
+		Timer:      cfg.Timer,
 	})
 	m.node = &n
 
@@ -333,11 +383,22 @@ func (m *Mediator) CatchUp(source *network.Message, sn blockchain.BlockSn) {
 	m.selfChan <- catchUpStatusEvent{source, sn}
 }
 
+// Called in Node's worker goroutine.
+func (m *Mediator) UpdateEpoch(cNota blockchain.ClockMsgNota) {
+	m.selfChan <- cNota
+}
+
 // NodeClient - end
 
 //
 // ChainSyncerClient - begin
 //
+// Called in the ChainSyncer's worker goroutine in the future.
+func (m *Mediator) RequestEpochProof(id string, epoch blockchain.Epoch) {
+	logger.Debug("[%s] send request for the proof of epoch=%d to id=%s", m.loggingId, epoch, id)
+	m.selfChan <- requestEpochProofEvent{id, epoch}
+}
+
 // Called in the ChainSyncer's worker goroutine in the future.
 func (m *Mediator) RequestNotarizedBlock(id string, sn blockchain.BlockSn) {
 	logger.Debug("[%s] send request for notarized block %s to id=%s", m.loggingId, sn, id)
@@ -411,13 +472,19 @@ func (m *Mediator) respondProposalRequest(msg *network.Message) {
 func (m *Mediator) requestUnnotarizedProposals() error {
 	nm := network.NewMessage(uint8(TypeRequestUnnotarizedProposals), 0, nil)
 	sn := m.chain.GetFreshestNotarizedChain().GetBlockSn()
+	epoch := m.epochManager.GetEpoch()
+	if epoch < sn.Epoch {
+		return errors.Errorf("[%s] epoch %d is behind freshest notarized block %s",
+			m.loggingId, epoch, sn)
+	}
+
 	for id, handle := range m.connections {
-		if m.role.IsPrimaryProposer(id, sn.Epoch) {
+		if m.role.IsPrimaryProposer(id, epoch) {
 			return m.host.Send(handle, nm)
 		}
 	}
-	return errors.Errorf("[%s] haven't connected to the primary proposer at %s",
-		m.loggingId, sn)
+	return errors.Errorf("[%s] haven't connected to the primary proposer at %d",
+		m.loggingId, epoch)
 }
 
 // Called in handleEventLoop goroutine for now.
@@ -441,7 +508,42 @@ func (m *Mediator) respondUnnotarizedProposals(msg *network.Message) {
 	}
 }
 
-// ChainSyncerClient - end
+// Called in handleEventLoop goroutine for now.
+func (m *Mediator) respondEpoch(msg *network.Message) {
+	tmp, _, err := utils.BytesToUint32(msg.GetBlob())
+	if err != nil {
+		logger.Warn("[%s] receive invalid request for epoch; err=%s", m.loggingId, err)
+		return
+	}
+	epoch := blockchain.Epoch(tmp)
+
+	var nm *network.Message
+	localEpoch := m.epochManager.GetEpoch()
+	// Instead of responding epoch, always respond the proof for localEpoch.
+	// This approach has some advantages:
+	// * The other end will get latest epoch.
+	// * This node may not have the proof of epoch.
+	if epoch > localEpoch {
+		logger.Info("[%s] invalid request for epoch %d > %d", m.loggingId, epoch, localEpoch)
+		nm = network.NewMessage(uint8(TypeRespondEpochInvalid), 0, utils.Uint32ToBytes(uint32(epoch)))
+	} else if cNota := m.epochManager.GetClockMsgNota(localEpoch); cNota != nil {
+		logger.Debug("[%s] respond epoch %d(%d) with clock message notarization",
+			m.loggingId, epoch, localEpoch)
+		nm = network.NewMessage(uint8(TypeRespondEpochByClockMsgNota), 0, cNota.GetBody())
+	} else if nota := m.epochManager.GetNotarization(localEpoch); nota != nil {
+		logger.Debug("[%s] respond epoch %d(%d) with notarization %s",
+			m.loggingId, epoch, localEpoch, nota.GetBlockSn())
+		nm = network.NewMessage(uint8(TypeRespondEpochByNotarization), 0, nota.GetBody())
+	} else {
+		logger.Error("[%s] there is no proof for epoch %d(%d)", m.loggingId, epoch, localEpoch)
+		bytes := utils.Uint32ToBytes(uint32(epoch))
+		bytes = append(bytes, utils.Uint32ToBytes(uint32(localEpoch))...)
+		nm = network.NewMessage(uint8(TypeRespondEpochNotExisted), 0, bytes)
+	}
+	if err := msg.Reply(nm); err != nil {
+		logger.Warn("[%s] %s", m.loggingId, err)
+	}
+}
 
 func (m *Mediator) notifyEvent(e interface{}) {
 	m.eventChansMutex.Lock()
@@ -464,16 +566,17 @@ func (m *Mediator) Start() error {
 		var err error
 		status := m.getStatus()
 		logger.Warn("[%s] init state: %s", m.loggingId, status)
-		if m.role.IsPrimaryProposer("", status.FncBlockSn.Epoch) {
-			nm := network.NewMessage(uint8(TypeRequestStatus), 0, nil)
-			if err := m.host.Broadcast(nm); err != nil {
-				// Maybe no node is connected. It's okay. We'll get the status after
-				// connections are establised.
-				logger.Warn("[%s] failed to broadcast the status request; err=%s", m.loggingId, err)
-			}
-		}
+		epoch := m.epochManager.GetEpoch()
 		if err = m.node.Start(); err != nil {
 			return err
+		}
+		m.node.SetEpoch(epoch)
+		if err := m.syncer.SetEpoch(epoch); err != nil {
+			logger.Warn("[%s] %s", m.loggingId, err)
+		}
+		if epoch > m.chain.GetFreshestNotarizedChain().GetBlockSn().Epoch &&
+			m.role.IsPrimaryProposer("", epoch) {
+			m.selfChan <- reconciliationWithAllEvent{}
 		}
 		go m.handleEventLoop(stopChan, stoppedChan)
 		return nil
@@ -587,8 +690,14 @@ func (m *Mediator) onReceivedFreshestNotarizedChainExtendedEvent(
 		if nota := m.chain.GetNotarization(e.Sn); nota == nil {
 			utils.Bug("notarization %s does not exist after receiving "+
 				"FreshestNotarizedChainExtendedEvent", e.Sn)
-		} else {
-			m.epochManager.UpdateByNotarization(nota)
+		} else if nota.GetBlockSn().Epoch > m.epochManager.GetEpoch() {
+			oldEpoch := m.epochManager.GetEpoch()
+			if err := m.epochManager.UpdateByNotarization(nota); err == nil {
+				logger.Warn("[%s] the freshest notarized block has newer epoch (%s); "+
+					"update epoch from %d to %d", m.loggingId, nota.GetBlockSn(),
+					oldEpoch, m.epochManager.GetEpoch())
+				m.onEpochUpdated()
+			}
 		}
 	}
 	if err := m.syncer.SetFreshestNotarizedChainBlockSn(e.Sn); err != nil {
@@ -642,8 +751,17 @@ func (m *Mediator) onReceivedFinalizedChainExtendedEvent(
 		if err := m.reconfigurer.UpdateHost(m.chain, m.host); err != nil {
 			logger.Error("failed to update Host during reconfiguration %s: %s", e.Sn, err)
 		}
+		oldEpoch := m.epochManager.GetEpoch()
 		if err := m.reconfigurer.UpdateEpochManager(m.chain, m.epochManager); err != nil {
 			logger.Error("failed to update EpochManager during reconfiguration %s: %s", e.Sn, err)
+		} else {
+			newEpoch := m.epochManager.GetEpoch()
+			if err := m.node.SetEpoch(newEpoch); err != nil {
+				logger.Warn("[%s] %s", m.loggingId, err)
+			}
+			if err := m.syncer.SetEpoch(newEpoch); err != nil {
+				logger.Warn("[%s] %s", m.loggingId, err)
+			}
 		}
 
 		// NOTE: the management of the worker goroutine of blockchain:
@@ -658,11 +776,10 @@ func (m *Mediator) onReceivedFinalizedChainExtendedEvent(
 		}
 		m.blockChan = nil
 		newEpoch := m.epochManager.GetEpoch()
-		logger.Info("[%s] update epoch to %d due to the reconfiguration", m.loggingId, newEpoch)
-		m.syncer.SetEpoch(newEpoch)
+		logger.Info("[%s] update epoch from %d to %d due to the reconfiguration",
+			m.loggingId, oldEpoch, newEpoch)
 		if m.role.IsPrimaryProposer("", newEpoch) {
-			// TODO(thunder): check whether we can reduce the chance of losing the last blocks.
-			m.selfChan <- startCreatingBlocksEvent{false}
+			m.performReconciliationWithAll()
 		}
 	} else if !m.reconfFinalizedByBlockSn.IsNil() && e.Sn.S == 1 {
 		// After the reconfiguration, the new proposers and voters have liveness now.
@@ -701,11 +818,7 @@ func (m *Mediator) handleSelfMessage(msg interface{}) {
 		if status.Epoch < v.sn.Epoch {
 			logger.Warn("[%s] invalid request: current epoch=%d, request to catch up %s",
 				m.loggingId, status.Epoch, v.sn)
-			// TODO(thunder): catch up epoch first and remove this temporal workaround.
-			logger.Warn("[%s] force update epoch=%d as a workaround", m.loggingId, v.sn.Epoch)
-			m.epochManager.(*EpochManagerFake).SetEpoch(v.sn.Epoch)
-			status.Epoch = v.sn.Epoch
-			//break
+			break
 		}
 		if status.FncBlockSn.Compare(v.sn) >= 0 {
 			break
@@ -713,54 +826,36 @@ func (m *Mediator) handleSelfMessage(msg interface{}) {
 		status.FncBlockSn = v.sn
 		logger.Info("[%s] catch up %s:%s", m.loggingId, id, status)
 		m.catchUpStatus(id, status, CatchUpPolicyIfNotInProgress)
-	case startCreatingBlocksEvent:
-		if m.blockChan != nil {
-			if !v.expectMayBeRunning {
-				logger.Error(
-					"[%s] failed to restart creating blocks because the chain is still creating blocks",
-					m.loggingId)
-			}
-			break
-		}
-		fnc := m.chain.GetFreshestNotarizedChain()
-		sn := fnc.GetBlockSn()
-		epoch := m.epochManager.GetEpoch()
-		if sn.Epoch >= epoch {
-			logger.Error(
-				"[%s] failed to create a new block: epoch %d is not greater "+
-					"than the freshest notarized chain's epoch (%s)", m.loggingId, epoch, sn)
-			break
-		}
-
-		count := 0
-		for id := range m.syncedIds {
-			if m.role.IsVoter(id, sn.Epoch) {
-				count++
-			}
-		}
-		// TODO(thunder): can wait longer if the time budget is enough.
-		// Start making the proposal after catching up 2/3 voters' status.
-		nVoter := m.role.GetNumVoters(sn.Epoch)
-		if nVoter <= 0 {
-			logger.Error("[%s] there is no voter at %s", m.loggingId, sn)
-			break
-			// TODO(thunder): get the ratio from Verifier.
-		} else if float64(count) < math.Ceil(float64(nVoter)*2.0/3.0) {
-			logger.Info("[%s] postpone starting creating new blocks; caught up %d/%d voters",
-				m.loggingId, count, nVoter)
-			break
-		}
-
-		// Ready to create new blocks.
-		var err error
-		if m.blockChan, err = m.chain.StartCreatingNewBlocks(epoch); err != nil {
-			logger.Error("[%s] cannot start creating new blocks; err=%s", m.loggingId, err)
-		} else {
-			logger.Info("[%s] start creating new blocks from %s (epoch=%d)",
-				m.loggingId, sn, epoch)
-		}
 	case chan DebugState:
 		v <- m.getDebugState()
+	case blockchain.ClockMsgNota:
+		oldEpoch := m.epochManager.GetEpoch()
+		if oldEpoch > v.GetEpoch() {
+			break
+		}
+		if err := m.epochManager.UpdateByClockMsgNota(v); err != nil {
+			logger.Error("[%s] cannot update epoch to %d with a verified clock message notarization",
+				m.loggingId, v.GetEpoch())
+			break
+		}
+		newEpoch := m.epochManager.GetEpoch()
+		if newEpoch == oldEpoch {
+			break
+		}
+		logger.Info("[%s] update epoch from %d to %d due to clock message notarization",
+			m.loggingId, oldEpoch, newEpoch)
+		m.onEpochUpdated()
+	case reconciliationWithAllEvent:
+		m.performReconciliationWithAll()
+	case requestEpochProofEvent:
+		if handle, ok := m.connections[v.id]; ok {
+			nm := network.NewMessage(uint8(TypeRequestEpoch), 0, utils.Uint32ToBytes(uint32(v.epoch)))
+			if err := m.host.Send(handle, nm); err != nil {
+				logger.Warn("[%s] %s", err)
+			}
+		} else {
+			logger.Error("[%s] cannot find connection handle for id=%s", m.loggingId, v.id)
+		}
 	case requestDataEvent:
 		if handle, ok := m.connections[v.id]; ok {
 			nm := network.NewMessage(v.typ, 0, v.sn.ToBytes())
@@ -774,9 +869,6 @@ func (m *Mediator) handleSelfMessage(msg interface{}) {
 	case onCaughtUpEvent:
 		m.syncedIds[v.id] = true
 		epoch := m.epochManager.GetEpoch()
-		if m.role.IsPrimaryProposer("", epoch) {
-			m.selfChan <- startCreatingBlocksEvent{true}
-		}
 		// NOTE: If the bootnode doesn't have the last unnotarized proposals to finalize
 		// the reconfiguration block, the new voters in the next generation won't get enough blocks
 		// to finalize the reconfiguration block. Force the bootnode to fetch unnotarized proposals
@@ -790,6 +882,80 @@ func (m *Mediator) handleSelfMessage(msg interface{}) {
 				logger.Warn("[%s] %s", m.loggingId, err)
 			}
 		}
+		if !m.role.IsPrimaryProposer("", epoch) || m.blockChan != nil {
+			break
+		}
+
+		if m.reconciliationWithAllBeginTime.IsZero() {
+			// We've scheduled a startCreatingBlocksEvent.
+			break
+		}
+
+		// See if the primary proposer is ready to propose.
+		fncSn := m.chain.GetFreshestNotarizedChain().GetBlockSn()
+		if fncSn.Epoch >= epoch {
+			logger.Error(
+				"[%s] failed to create a new block: epoch %d is not greater "+
+					"than the freshest notarized chain's epoch (%s)", m.loggingId, epoch, fncSn)
+			break
+		}
+
+		count := 0
+		for id := range m.syncedIds {
+			if m.role.IsVoter(id, epoch) {
+				count++
+			}
+		}
+		nVoter := m.role.GetNumVoters(epoch)
+		if nVoter <= 0 {
+			logger.Error("[%s] there is no voter at %d", m.loggingId, epoch)
+			break
+			// TODO(thunder): get the ratio from Verifier.
+		} else if float64(count) < math.Ceil(float64(nVoter)*2.0/3.0) {
+			logger.Info("[%s] postpone starting creating new blocks; caught up %d/%d voters",
+				m.loggingId, count, nVoter)
+			break
+		}
+
+		now := time.Now()
+		targetTime := m.reconciliationWithAllBeginTime.Add(
+			time.Duration(delayOfMakingFirstProposal) * time.Millisecond)
+		m.reconciliationWithAllBeginTime = time.Time{}
+		if now.After(targetTime) {
+			m.selfChan <- startCreatingBlocksEvent{}
+		} else {
+			go func(ch chan interface{}) {
+				// Delay the reconciliation a while, so the freshest notarized chain may extend.
+				// Note that the proposal may fail without the delay. Here is an example:
+				// 1. The last block of the freshest notarized chain is (1,12).
+				// 2. Ask the chain to create new block, so (2,1) extends from (1,12).
+				// 3. Before sending the proposal, the proposer at epoch=1 received enough votes to
+				//    make notarization (1,13) and broadcast it.
+				// 4. Broadcast the proposal (2,1)
+				// Then the voters will reject to vote because the last block of their freshest notarized
+				// chains is (1,13).
+				//
+				// The above scenario is found by testing TestVoterReconfiguration 50 times.
+				// It's more easily to reproduce when running the test without printing lots of logs.
+				//
+				// Delay a while to collect more info potentially.
+				<-time.NewTimer(targetTime.Sub(now)).C
+				ch <- startCreatingBlocksEvent{}
+			}(m.selfChan)
+		}
+	case startCreatingBlocksEvent:
+		if m.blockChan != nil {
+			break
+		}
+		epoch := m.epochManager.GetEpoch()
+		var err error
+		if m.blockChan, err = m.chain.StartCreatingNewBlocks(epoch); err != nil {
+			logger.Error("[%s] cannot start creating new blocks; err=%s", m.loggingId, err)
+		} else {
+			fncSn := m.chain.GetFreshestNotarizedChain().GetBlockSn()
+			logger.Info("[%s] start creating new blocks from %s (epoch=%d)",
+				m.loggingId, fncSn, epoch)
+		}
 	default:
 		logger.Warn("[%s] received unknown self message %v", m.loggingId, msg)
 	}
@@ -801,6 +967,7 @@ func (m *Mediator) broadcast(msg blockchain.Message) {
 		p := msg.(blockchain.Proposal)
 		item := &Item{p.GetBlockSn(), p}
 		if m.recentProposals.Get(item) == nil {
+			m.lastBroadcastedProposal = p.GetBlockSn()
 			m.recentProposals.ReplaceOrInsert(item)
 			m.unnotarizedProposals[p.GetBlockSn()] = p
 			for _, n := range p.GetBlock().GetNotarizations() {
@@ -827,6 +994,48 @@ func (m *Mediator) broadcast(msg blockchain.Message) {
 
 	if err := m.host.Broadcast(nm); err != nil {
 		logger.Warn("[%s] cannot broadcast %s (sn=%s)", m.loggingId, msg.GetType(), sn)
+	}
+}
+
+// Called in the handleEventLoop goroutine.
+func (m *Mediator) onEpochUpdated() {
+	newEpoch := m.epochManager.GetEpoch()
+	if m.blockChan != nil {
+		logger.Info("[%s] stop creating new block because epoch is updated to %d",
+			m.loggingId, newEpoch)
+		if err := m.chain.StopCreatingNewBlocks(); err != nil {
+			logger.Warn("[%s] %s", m.loggingId, err)
+		}
+		m.blockChan = nil
+	}
+	m.node.SetEpoch(newEpoch)
+	if err := m.syncer.SetEpoch(newEpoch); err != nil {
+		logger.Warn("[%s] %s", m.loggingId, err)
+	}
+	m.reconciliationWithAllBeginTime = time.Time{}
+	if m.role.IsPrimaryProposer("", newEpoch) {
+		m.performReconciliationWithAll()
+	}
+}
+
+// Called in the handleEventLoop goroutine.
+// This function is only called on the primary proposer.
+func (m *Mediator) performReconciliationWithAll() {
+	logger.Info("[%s] performReconciliationWithAll (epoch=%d)",
+		m.loggingId, m.epochManager.GetEpoch())
+	m.reconciliationWithAllBeginTime = time.Now()
+	m.syncedIds = make(map[string]bool)
+	nm := network.NewMessage(uint8(TypeRequestStatus), 0, nil)
+	// The broadcast triggers a series of events:
+	// 1. Receive TypeRespondStatus from each connected node
+	//    and call catchUpStatus() to start syncing.
+	// 2. After having caught up the target node,
+	//    call OnCaughtUp() to see if we can start creating new blocks.
+	// 3. Make proposals from the new blocks and broadcast them.
+	if err := m.host.Broadcast(nm); err != nil {
+		// Maybe no node is connected. It's okay. We'll get the status after
+		// connections are established.
+		logger.Warn("[%s] failed to broadcast the status request; err=%s", m.loggingId, err)
 	}
 }
 
@@ -881,6 +1090,18 @@ func (m *Mediator) handleNetworkMessage(msg *network.Message) {
 		} else {
 			m.node.AddNotarization(n)
 		}
+	case blockchain.TypeClockMsg:
+		if c, _, err := m.unmarshaller.UnmarshalClockMsg(msg.GetBlob()); err != nil {
+			logger.Warn("[%s] handleEventLoop receives invalid clock message; err=%s", err)
+		} else {
+			m.node.AddClockMsg(c)
+		}
+	case blockchain.TypeClockMsgNota:
+		if cNota, _, err := m.unmarshaller.UnmarshalClockMsgNota(msg.GetBlob()); err != nil {
+			logger.Warn("[%s] handleEventLoop receives invalid clock message notarization; err=%s", err)
+		} else {
+			m.node.AddClockMsgNota(cNota)
+		}
 	}
 }
 
@@ -898,7 +1119,12 @@ func (m *Mediator) handleMediatorMessage(msg *network.Message) {
 		if status, err := UnmarshalStatus(msg.GetBlob()); err != nil {
 			logger.Error("[%s] receive invalid status; err=%s", m.loggingId, err)
 		} else {
-			m.performReconciliation(msg, status)
+			// See if we need to catch up.
+			id := m.getConsensusId(msg.GetConnectionHandle())
+			// TODO(thunder): clean up unnecessary log related to the bootnode.
+			logger.Info("[%s] receive status %s:%s (current=%s)",
+				m.loggingId, id, status, m.getStatus())
+			m.catchUpStatus(id, status, CatchUpPolicyMust)
 		}
 	case TypeRequestNotarizedBlock:
 		m.respondNotarizedBlockRequest(msg)
@@ -957,6 +1183,24 @@ func (m *Mediator) handleMediatorMessage(msg *network.Message) {
 				m.node.AddProposal(p, msg, BlockCreatedByOther)
 			}
 		}
+	case TypeRequestEpoch:
+		m.respondEpoch(msg)
+	case TypeRespondEpochByClockMsgNota:
+		if clockMsgNota, _, err := m.unmarshaller.UnmarshalClockMsgNota(msg.GetBlob()); err != nil {
+			logger.Warn("[%s] invalid clock message nota; err=%s", m.loggingId, err)
+		} else {
+			m.node.AddClockMsgNota(clockMsgNota)
+		}
+	case TypeRespondEpochByNotarization:
+		if nota, _, err := m.unmarshaller.UnmarshalNotarization(msg.GetBlob()); err != nil {
+			logger.Warn("[%s] invalid notarization; err=%s", m.loggingId, err)
+		} else {
+			m.node.AddNotarization(nota)
+		}
+	case TypeRespondEpochNotExisted:
+		// TODO(thunder)
+	case TypeRespondEpochInvalid:
+		// TODO(thunder)
 	}
 }
 
@@ -1014,38 +1258,46 @@ func (m *Mediator) getStatus() Status {
 
 // Called in the handleEventLoop goroutine.
 func (m *Mediator) getDebugState() DebugState {
-	var minSn, maxSn blockchain.BlockSn
-	if r := LLRBItemToProposal(m.recentProposals.Min()); r != nil {
-		minSn = r.GetBlockSn()
-	}
-	if r := LLRBItemToProposal(m.recentProposals.Max()); r != nil {
-		maxSn = r.GetBlockSn()
-	}
+	var sb strings.Builder
+	_, _ = sb.WriteString("[")
+	first := true
+	m.recentProposals.AscendGreaterOrEqual(m.recentProposals.Min(), func(i llrb.Item) bool {
+		p := LLRBItemToProposal(i)
+		b := p.GetBlock()
+		if !first {
+			_, _ = sb.WriteString(" ")
+		}
+		_, _ = sb.WriteString(fmt.Sprintf("%s<-%s", b.GetParentBlockSn(), b.GetBlockSn()))
+		first = false
+		return true
+	})
+	_, _ = sb.WriteString("]")
+
+	ch := m.syncer.GetDebugState()
+	ss := <-ch
+
 	var syncedIds []string
 	for id := range m.syncedIds {
 		syncedIds = append(syncedIds, id)
 	}
 	sort.Strings(syncedIds)
-	ch := m.syncer.GetDebugState()
-	ss := <-ch
-	return DebugState{
-		Identity:          m.loggingId,
-		Status:            m.getStatus(),
-		SyncerState:       ss,
-		SyncedIds:         syncedIds,
-		MinRecentProposal: minSn,
-		MaxRecentProposal: maxSn,
+
+	var connectedIds []string
+	for id := range m.connections {
+		connectedIds = append(connectedIds, id)
 	}
-}
+	sort.Strings(connectedIds)
 
-// Called in handleEventLoop goroutine.
-func (m *Mediator) performReconciliation(source *network.Message, targetStatus Status) {
-	id := m.getConsensusId(source.GetConnectionHandle())
-	// TODO(thunder): clean up unnecessary log related to the bootnode.
-	logger.Info("[%s] perform reconciliation %s -> %s:%s",
-		m.loggingId, m.getStatus(), id, targetStatus)
-
-	m.catchUpStatus(id, targetStatus, CatchUpPolicyMust)
+	return DebugState{
+		Identity:             m.loggingId,
+		Status:               m.getStatus(),
+		SyncerState:          ss,
+		SyncedIds:            syncedIds,
+		ConnectedIds:         connectedIds,
+		ProposalInfo:         sb.String(),
+		IsMakingBlock:        m.blockChan != nil,
+		LastBroadcastedBlock: m.lastBroadcastedProposal,
+	}
 }
 
 func (m *Mediator) getConsensusId(handle network.ConnectionHandle) string {
@@ -1059,11 +1311,21 @@ func (m *Mediator) getConsensusId(handle network.ConnectionHandle) string {
 
 // Called in handleEventLoop goroutine.
 func (m *Mediator) catchUpStatus(id string, targetStatus Status, policy CatchUpPolicy) {
+	if _, ok := m.connections[id]; !ok {
+		// The connection to id is closed.
+		logger.Info("[%s] ignore catching up %s because the connection is closed", m.loggingId, id)
+		return
+	}
 	current := m.getStatus()
+	if !current.isBehind(targetStatus) {
+		logger.Info("[%s] already catching up %s (%s > %s)", m.loggingId, id, current, targetStatus)
+		m.OnCaughtUp(id, targetStatus)
+		return
+	}
+	delete(m.syncedIds, id)
 	if err := m.syncer.SetFreshestNotarizedChainBlockSn(current.FncBlockSn); err != nil {
 		logger.Warn("[%s] %s", m.loggingId, err)
 	}
-	// TODO(thunder): Catch up Epoch.
 	if err := m.syncer.CatchUp(id, targetStatus, policy); err != nil {
 		logger.Warn("[%s] %s", m.loggingId, err)
 	}
@@ -1190,6 +1452,10 @@ func (m *Mediator) closeConnection(handle network.ConnectionHandle) {
 	m.host.CloseConnection(handle)
 	delete(m.handshakeStates, handle)
 	id := m.getIdByConnectionHandle(handle)
+	logger.Info("[%s] close connection to %s", m.loggingId, id)
+	if err := m.syncer.CancelCatchingUp(id); err != nil {
+		logger.Warn("[%s] failed to cancel catching up with %s; err=%s", m.loggingId, id, err)
+	}
 	delete(m.syncedIds, id)
 	delete(m.connections, id)
 }
@@ -1214,12 +1480,23 @@ func UnmarshalStatus(bytes []byte) (Status, error) {
 	var tmp uint32
 	if tmp, bytes, err = utils.BytesToUint32(bytes); err != nil {
 		return Status{}, err
+	} else {
+		s.Epoch = blockchain.Epoch(tmp)
 	}
-	s.Epoch = blockchain.Epoch(tmp)
 	if s.ReconfFinalizedByBlockSn, _, err = blockchain.NewBlockSnFromBytes(bytes); err != nil {
 		return Status{}, err
 	}
 	return s, nil
+}
+
+func (s Status) isBehind(other Status) bool {
+	if s.Epoch < other.Epoch {
+		return true
+	}
+	if s.FncBlockSn.Compare(other.FncBlockSn) < 0 {
+		return true
+	}
+	return s.ReconfFinalizedByBlockSn.Compare(other.ReconfFinalizedByBlockSn) < 0
 }
 
 func (s Status) String() string {
